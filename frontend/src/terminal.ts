@@ -8,6 +8,10 @@ import '@xterm/xterm/css/xterm.css';
 import { t } from './i18n';
 import { centerTerminalText } from './terminal-text';
 import { localizedSSHMessage } from './terminal-status';
+import {
+  getActiveTerminalTheme,
+  onTerminalThemeChange,
+} from './theme';
 
 const TRZSZ_MAX_DATA_CHUNK_SIZE = 2 * 1024 * 1024;
 
@@ -23,120 +27,14 @@ export interface SSHConnectionConfig {
   locationHint?: string;
 }
 
+export interface TerminalSelectionAnchor {
+  clientX: number;
+  clientY: number;
+}
+
 interface ConnectOptions {
   resetDisplay?: boolean;
 }
-
-export const THEMES = {
-  cyberpunk: {
-    background: '#0a0a0a',
-    foreground: '#4af626',
-    cursor: '#14d1ff',
-    cursorAccent: '#0a0a0a',
-    selectionBackground: '#273747',
-  },
-  glacier: {
-    background: '#0a192f',
-    foreground: '#64ffda',
-    cursor: '#e6f1ff',
-    cursorAccent: '#0a192f',
-    selectionBackground: '#112240',
-  },
-  gruvbox: {
-    background: '#282828',
-    foreground: '#ebdbb2',
-    cursor: '#d3869b',
-    cursorAccent: '#282828',
-    selectionBackground: '#504945',
-  }
-};
-
-export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
-  cyberpunk: {
-    '--bg': '#0a0a0a',
-    '--bg-surface': '#121212',
-    '--bg-elevated': '#131313',
-    '--bg-terminal': '#0e0e0e',
-    '--text': '#4af626',
-    '--text-muted': '#bbccb0',
-    '--text-dim': '#3c4b36',
-    '--accent': '#4af626',
-    '--accent-secondary': '#14d1ff',
-    '--accent-secondary-light': '#b7eaff',
-    '--border': '#1f1f1f',
-    '--border-strong': '#3c4b36',
-    '--error': '#ffb4ab',
-    '--error-bg': '#93000a',
-    '--on-accent': '#022100',
-    '--surface-dot': '#353534',
-    '--scrollbar-track': 'rgba(28, 27, 27, 0.5)',
-    '--scrollbar-thumb': 'rgba(60, 75, 54, 0.8)',
-    '--scrollbar-thumb-hover': 'rgba(134, 149, 125, 0.8)',
-    '--scanline-tint': 'rgba(74, 246, 38, 0.02)',
-    '--accent-glow': 'rgba(74, 246, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.8)',
-    '--on-surface': '#e5e2e1',
-    '--on-surface-variant': '#bbccb0',
-    '--agent-user-color': '#4af626',
-    '--agent-agent-color': '#14d1ff',
-  },
-  glacier: {
-    '--bg': '#0a192f',
-    '--bg-surface': '#0d2137',
-    '--bg-elevated': '#112240',
-    '--bg-terminal': '#061526',
-    '--text': '#64ffda',
-    '--text-muted': '#8892b0',
-    '--text-dim': '#495670',
-    '--accent': '#64ffda',
-    '--accent-secondary': '#e6f1ff',
-    '--accent-secondary-light': '#ccd6f6',
-    '--border': '#1d3557',
-    '--border-strong': '#495670',
-    '--error': '#ff6b6b',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#0a192f',
-    '--surface-dot': '#1d3557',
-    '--scrollbar-track': 'rgba(10, 25, 47, 0.5)',
-    '--scrollbar-thumb': 'rgba(100, 255, 218, 0.2)',
-    '--scrollbar-thumb-hover': 'rgba(100, 255, 218, 0.4)',
-    '--scanline-tint': 'rgba(100, 255, 218, 0.02)',
-    '--accent-glow': 'rgba(100, 255, 218, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.85)',
-    '--on-surface': '#e6f1ff',
-    '--on-surface-variant': '#8892b0',
-    '--agent-user-color': '#64ffda',
-    '--agent-agent-color': '#e6f1ff',
-  },
-  gruvbox: {
-    '--bg': '#282828',
-    '--bg-surface': '#303030',
-    '--bg-elevated': '#282828',
-    '--bg-terminal': '#1d2021',
-    '--text': '#ebdbb2',
-    '--text-muted': '#a89984',
-    '--text-dim': '#665c54',
-    '--accent': '#b8bb26',
-    '--accent-secondary': '#83a598',
-    '--accent-secondary-light': '#8ec07c',
-    '--border': '#3c3836',
-    '--border-strong': '#665c54',
-    '--error': '#fb4934',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#282828',
-    '--surface-dot': '#3c3836',
-    '--scrollbar-track': 'rgba(40, 40, 40, 0.5)',
-    '--scrollbar-thumb': 'rgba(168, 153, 132, 0.3)',
-    '--scrollbar-thumb-hover': 'rgba(168, 153, 132, 0.5)',
-    '--scanline-tint': 'rgba(184, 187, 38, 0.02)',
-    '--accent-glow': 'rgba(184, 187, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.75)',
-    '--on-surface': '#ebdbb2',
-    '--on-surface-variant': '#a89984',
-    '--agent-user-color': '#b8bb26',
-    '--agent-agent-color': '#83a598',
-  },
-};
 
 export class SSHTerminal {
   private terminal: Terminal;
@@ -168,7 +66,29 @@ export class SSHTerminal {
   private lastPingTime: number | null = null;
   private wsLatency: number | null = null;
   private onLatencyUpdated?: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void;
+  private onSelectionChanged?: (selection: string, anchor: TerminalSelectionAnchor | null) => void;
+  private selectionAnchor: TerminalSelectionAnchor | null = null;
+  private selectionPointerActive = false;
+  private themeCleanup: () => void;
   private resizeListener: () => void;
+  private readonly selectionPointerDownListener = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    this.selectionPointerActive = true;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+  };
+  private readonly selectionPointerMoveListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    if (this.terminal.hasSelection()) {
+      this.notifySelectionChanged();
+    }
+  };
+  private readonly selectionPointerUpListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    this.selectionPointerActive = false;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    this.notifySelectionChanged();
+  };
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
@@ -179,7 +99,7 @@ export class SSHTerminal {
       cursorStyle: 'block',
       fontSize: 14,
       fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-      theme: THEMES.cyberpunk,
+      theme: getActiveTerminalTheme(),
       allowProposedApi: true,
       scrollback: 10000,
     });
@@ -189,7 +109,19 @@ export class SSHTerminal {
     this.terminal.loadAddon(new WebLinksAddon());
     this.searchAddon = new SearchAddon();
     this.terminal.loadAddon(this.searchAddon);
+    this.themeCleanup = onTerminalThemeChange((theme) => {
+      this.terminal.options.theme = theme;
+    });
     this.registerCursorRestoreHandlers();
+    this.terminalDisposables.push(
+      this.terminal.onSelectionChange(() => {
+        this.notifySelectionChanged();
+      }),
+    );
+    this.container.addEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.addEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.addEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.addEventListener('pointercancel', this.selectionPointerUpListener, true);
 
     // Ctrl+Shift+F to toggle search bar
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -236,30 +168,6 @@ export class SSHTerminal {
     });
   }
 
-  setTheme(themeName: keyof typeof THEMES): void {
-    this.terminal.options.theme = THEMES[themeName];
-    const uiVars = UI_THEMES[themeName];
-    if (uiVars) {
-      const root = document.documentElement;
-      Object.entries(uiVars).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-    localStorage.setItem('cloudssh_theme', themeName);
-  }
-
-  applyImportedTheme(data: { terminal?: Record<string, string>; ui?: Record<string, string> }): void {
-    if (data.terminal) {
-      this.terminal.options.theme = data.terminal as any;
-    }
-    if (data.ui) {
-      const root = document.documentElement;
-      Object.entries(data.ui).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-  }
-
   setSessionClosedHandler(handler: (event: CloseEvent) => void): void {
     this.onSessionClosed = handler;
   }
@@ -278,6 +186,16 @@ export class SSHTerminal {
     }
   }
 
+  /** 将文本填入当前远端终端输入行，不附加回车。 */
+  fillInput(text: string): boolean {
+    if (!text || /[\r\n]/.test(text)) return false;
+    if (this.ws?.readyState !== WebSocket.OPEN || !this.trzszFilter) return false;
+
+    this.trzszFilter.processTerminalInput(text);
+    this.terminal.focus();
+    return true;
+  }
+
   setLatencyUpdatedHandler(handler: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void): void {
     this.onLatencyUpdated = handler;
     if (this.cfLatency !== null || this.cfColo !== null || this.wsLatency !== null) {
@@ -285,8 +203,27 @@ export class SSHTerminal {
     }
   }
 
+  setSelectionChangeHandler(handler: (selection: string, anchor: TerminalSelectionAnchor | null) => void): void {
+    this.onSelectionChanged = handler;
+    this.notifySelectionChanged();
+  }
+
+  clearSelection(): void {
+    this.terminal.clearSelection();
+    this.selectionAnchor = null;
+    this.notifySelectionChanged();
+  }
+
   getSFTPWebSocketUrl(): string | null {
     return this.sftpAttachUrl;
+  }
+
+  private notifySelectionChanged(): void {
+    const selection = this.terminal.getSelection();
+    if (!selection) {
+      this.selectionAnchor = null;
+    }
+    this.onSelectionChanged?.(selection, this.selectionAnchor);
   }
 
   mount(): void {
@@ -765,6 +702,11 @@ export class SSHTerminal {
   dispose(): void {
     this.disconnect();
     window.removeEventListener('resize', this.resizeListener);
+    this.container.removeEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.removeEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.removeEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.removeEventListener('pointercancel', this.selectionPointerUpListener, true);
+    this.themeCleanup();
     this.terminalDisposables.forEach(d => d.dispose());
     this.terminalDisposables = [];
     this.terminal.dispose();
