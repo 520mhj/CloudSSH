@@ -29,7 +29,8 @@ src/
 │   ├── durable-object.ts  # SSHSessionDO - manages SSH sessions
 │   ├── ssh-session.ts     # SSH session logic, multi-channel routing, SFTP handling
 │   ├── sftp-handler.ts    # SFTP protocol ops, task queue, concurrent download, upload tracking
-│   ├── user-db.ts    # UserDBDO - user/server storage
+│   ├── user-db.ts    # UserDBDO - user/server storage（含单层标签持久化）
+│   ├── server-tags.ts # 服务器标签规范化与 SQLite JSON 序列化
 │   ├── auth.ts       # GitHub OAuth handling
 │   ├── agent/        # AI Agent system
 │   │   ├── core.ts       # Agent control loop (LLM calls, tool execution)
@@ -63,11 +64,13 @@ frontend/
 │   ├── main.ts       # Frontend entry point (routing, theme, event handlers)
 │   ├── terminal.ts   # xterm.js terminal setup (search, dynamic RTT latency, log export)
 │   ├── tab-manager.ts # Tab manager (multi-session terminal/SFTP/Agent coordinator)
-│   ├── sftp-panel.ts # SFTP file manager UI (queue, cancel support)
+│   ├── sftp-panel.ts # SFTP file manager UI (multi-select, batch actions, queue, cancel)
+│   ├── sftp-selection.ts # Pure multi-selection state model
 │   ├── auth-form.ts  # Auth form & encrypted anonymous credentials storage/autofill
-│   ├── server-list.ts # Server management UI (card grid, add/edit/delete/connect)
+│   ├── server-list.ts # Server UI (tags, search, 9-card pagination, CRUD/connect)
 │   ├── agent/
-│   │   └── agent-panel.ts  # AI assistant sidebar (streaming output, Markdown rendering, thinking process, confirm dialogs)
+│   │   ├── agent-panel.ts  # AI assistant sidebar (context attachments, streaming, Markdown, confirmations)
+│   │   └── terminal-selection-context.ts # Selection snapshots and untrusted-data prompt boundary
 │   ├── ai-config.ts  # AI model configuration modal
 │   ├── style.css     # Global styles (CSS variable theme system)
 │   └── turnstile.d.ts # Turnstile type declarations
@@ -91,6 +94,15 @@ pnpm run build:frontend
 
 # Run tests
 pnpm test
+
+# Run worker + frontend type checks
+pnpm run typecheck
+
+# Run browser E2E and accessibility tests
+pnpm run test:e2e
+
+# Run the complete local quality gate
+pnpm run verify
 
 # Install frontend dependencies (separate from root)
 cd frontend && pnpm install
@@ -136,8 +148,8 @@ Required for optional features (configured in `wrangler.toml` or Cloudflare Dash
 | `/api/auth/callback` | GET | No | OAuth callback, creates user + session |
 | `/api/auth/logout` | POST | No | Logout, clears session |
 | `/api/auth/me` | GET | Yes | Returns current user info |
-| `/api/servers` | GET/POST | Yes | List or create saved servers |
-| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server |
+| `/api/servers` | GET/POST | Yes | List or create saved servers（含单层 `tags`） |
+| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server（含标签更新） |
 | `/api/servers/:id/connect` | POST | Yes | Generate one-time-token, return WebSocket URL |
 | `/api/user/theme` | GET/PUT | Yes | Get or save user custom theme |
 | `/api/known-hosts` | GET/POST/DELETE | Yes | Known host fingerprint CRUD (TOFU) |
@@ -209,6 +221,10 @@ ci: CI/CD 变更
 8. **Agent loop timeouts & Watchdog** - The agent run loop has a step-based timeout of 60 seconds (managed by a watchdog timer in `agent/core.ts` that resets after each LLM response or tool execution). When waiting for user confirmation via `agent_confirm`, the watchdog timer is paused to prevent timeouts due to user delays.
 9. **SSH rate limiting** - `/api/ssh` uses a bounded, Worker-isolate in-memory limiter for traffic shedding. It skips requests without `CF-Connecting-IP`; Turnstile and one-time tokens remain the connection authorization controls.
 10. **Tailwind is built locally** - `frontend/postcss.config.cjs` and `frontend/tailwind.config.cjs` generate Tailwind CSS during Vite builds. Do not reintroduce `cdn.tailwindcss.com`; keep content scan paths and theme variable mappings synchronized when adding frontend source locations or theme tokens.
+11. **Builds never install dependencies** - run `pnpm install --frozen-lockfile` before build/deploy. `scripts/build-html.js` requires exactly one JS and one CSS bundle so every production asset is inlined deterministically.
+12. **Server list organization** - server tags are stored as normalized JSON in SQLite, filtered client-side, and rendered with 9 items per page. Search/tag changes must reset pagination to page 1.
+13. **SFTP selection model** - file selection supports single, Cmd/Ctrl toggle, Shift range and select-all. Batch download reuses the sequential download queue; batch delete waits for all delete/rmdir results before refreshing.
+14. **Agent terminal selection context** - “Ask AI assistant” attaches one immutable selection snapshot per tab and never sends it by itself. New selections replace the pending snapshot; successful sends and session teardown clear it. Preserve the untrusted-data/non-authorization boundary in `terminal-selection-context.ts`.
 
 ## Deployment Notes
 

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { filterServers, type ServerConfig } from '../frontend/src/server-list';
+import {
+  filterServers,
+  normalizeTagsInput,
+  paginateServers,
+  type ServerConfig,
+} from '../frontend/src/server-list';
 import { getNetworkQuality } from '../frontend/src/network-quality';
 
 const servers: ServerConfig[] = [
@@ -12,6 +17,7 @@ const servers: ServerConfig[] = [
     port: 22,
     username: 'deploy',
     auth_method: 'publickey',
+    tags: ['production', 'api'],
     created_at: '',
     updated_at: '',
   },
@@ -23,6 +29,7 @@ const servers: ServerConfig[] = [
     port: 2222,
     username: 'DBAdmin',
     auth_method: 'password',
+    tags: ['staging', 'database'],
     created_at: '',
     updated_at: '',
   },
@@ -42,6 +49,17 @@ describe('服务器列表搜索', () => {
 
   it('没有匹配项时返回空列表', () => {
     expect(filterServers(servers, 'missing')).toEqual([]);
+  });
+
+  it('支持标签筛选、标签输入规范化和分页边界修正', () => {
+    expect(filterServers(servers, '', 'database')).toEqual([servers[1]]);
+    expect(normalizeTagsInput(' Production, production，data   base '))
+      .toEqual(['Production', 'data base']);
+    expect(paginateServers(servers, 99, 1)).toEqual({
+      items: [servers[1]],
+      currentPage: 2,
+      totalPages: 2,
+    });
   });
 });
 
@@ -120,11 +138,14 @@ describe('终端选区询问 Agent', () => {
     'utf8',
   );
 
-  it('监听完整选区并在点击入口后直接发送给 Agent', () => {
+  it('监听完整选区并在点击入口后附加到 Agent 输入区', () => {
     expect(terminalSource).toContain('this.terminal.onSelectionChange');
     expect(terminalSource).toContain('this.terminal.getSelection()');
-    expect(tabManagerSource).toContain("tab.agentPanel.sendMessage(t('agent.selectionPrompt'");
+    expect(tabManagerSource).toContain('tab.agentPanel.attachTerminalSelection(');
+    expect(tabManagerSource).not.toContain("tab.agentPanel.sendMessage(t('agent.selection");
     expect(tabManagerSource).toContain('tab.terminal.clearSelection()');
+    expect(agentSource).toContain('id="agent-context"');
+    expect(agentSource).toContain('clearTerminalSelectionContext()');
   });
 
   it('在鼠标选区末端显示浮动入口，取消选区后隐藏', () => {
@@ -152,5 +173,13 @@ describe('终端选区询问 Agent', () => {
     );
     expect(selectionFlow).not.toMatch(/slice|substring|maxLength|truncate/i);
     expect(sendMessageFlow).not.toMatch(/slice|substring|maxLength|truncate/i);
+  });
+
+  it('要求用户输入问题后发送，并为选区提供可访问的移除入口', () => {
+    expect(agentSource).toContain('if (!message) return false');
+    expect(agentSource).toContain("t('agent.removeSelection')");
+    expect(agentSource).toContain('aria-label=');
+    expect(agentSource).toContain('buildTerminalSelectionMessage(message, terminalSelection)');
+    expect(agentSource).toContain('if (selection) this.clearTerminalSelectionContext()');
   });
 });
