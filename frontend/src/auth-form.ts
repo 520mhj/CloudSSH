@@ -3,6 +3,8 @@ import type { TabManager } from './tab-manager';
 import { populateRegionSelect, regionLabel } from './regions';
 import { notify } from './ui-feedback';
 import { onLocaleChange, t, translateDocument } from './i18n';
+import { parsePort } from './port';
+import { getActiveColorScheme, onColorSchemeChange, type ColorScheme } from './theme';
 // --- Credential encryption helpers ---
 async function deriveKey(salt: Uint8Array): Promise<CryptoKey> {
   const raw = new TextEncoder().encode(window.location.origin + ':cloudssh');
@@ -56,10 +58,21 @@ export class ConnectionForm {
   private turnstileVerified = false;
   private turnstileWidgetId: string | null = null;
   private turnstileSitekey = '';
+  private turnstileTheme: ColorScheme | null = null;
 
   constructor(options: ConnectionFormOptions) {
     this.options = options;
     this.render();
+    onColorSchemeChange((colorScheme) => {
+      if (
+        this.turnstileEnabled
+        && this.turnstileSitekey
+        && !this.turnstileVerified
+        && this.turnstileTheme !== colorScheme
+      ) {
+        this.renderTurnstile();
+      }
+    });
     this.loadSavedCredentials();
     this.checkTurnstileConfig();
     onLocaleChange(() => {
@@ -112,12 +125,19 @@ export class ConnectionForm {
     const container = document.getElementById('turnstile-widget');
     if (!container || !window.turnstile) return;
 
+    if (this.turnstileWidgetId) {
+      window.turnstile.remove(this.turnstileWidgetId);
+      this.turnstileWidgetId = null;
+      container.replaceChildren();
+    }
+
     const wrapper = document.getElementById('turnstile-container');
     if (wrapper) wrapper.style.display = 'block';
 
+    this.turnstileTheme = getActiveColorScheme();
     this.turnstileWidgetId = window.turnstile.render(container, {
       sitekey: this.turnstileSitekey,
-      theme: 'dark',
+      theme: this.turnstileTheme,
       callback: async (token: string) => {
         // Verify with backend and get cookie
         try {
@@ -163,7 +183,7 @@ export class ConnectionForm {
             <label for="port" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.port">端口</label>
             <div class="flex items-center">
               <span class="text-muted mr-2">:</span>
-              <input id="port" class="terminal-input text-[13px]" placeholder="22" type="text" value="22">
+              <input id="port" class="terminal-input text-[13px]" placeholder="22" type="number" inputmode="numeric" min="1" max="65535" step="1" value="22" required>
             </div>
           </div>
         </div>
@@ -212,7 +232,7 @@ export class ConnectionForm {
           <label for="remember-me" class="text-xs text-muted cursor-pointer select-none" data-i18n="auth.remember">记住连接信息</label>
         </div>
         <div class="pt-4">
-          <button id="connect-btn" class="connect-btn w-full py-3 px-4 text-xs font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-2" type="button">
+          <button id="connect-btn" class="connect-btn w-full py-3 px-4 text-xs font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-2" type="submit">
             <span class="material-symbols-outlined" style="font-size: 18px;">power_settings_new</span>
             <span data-i18n="auth.execute">建立连接</span>
           </button>
@@ -232,12 +252,9 @@ export class ConnectionForm {
     `;
     translateDocument(container);
 
-    document.getElementById('connect-btn')!.addEventListener('click', () => {
-      this.handleConnect();
-    });
-
-    document.getElementById('connection-form')!.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') this.handleConnect();
+    document.getElementById('connection-form')!.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void this.handleConnect();
     });
 
     // 填充区域下拉选项（自动选项已存在于 HTML，populateRegionSelect 会完整替换）
@@ -444,9 +461,8 @@ export class ConnectionForm {
   private async handleConnect(): Promise<void> {
     const hostInput = (document.getElementById('host') as HTMLInputElement).value;
     const host = hostInput.replace(/^\[|\]$/g, '').trim();
-    const port = parseInt(
-      (document.getElementById('port') as HTMLInputElement).value || '22'
-    );
+    const portInput = document.getElementById('port') as HTMLInputElement;
+    const port = parsePort(portInput.value);
     const username = (document.getElementById('username') as HTMLInputElement).value;
     const password = (document.getElementById('password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('private-key') as HTMLTextAreaElement).value;
@@ -458,6 +474,12 @@ export class ConnectionForm {
     if (!host || !username) {
       notify(t('auth.validationHostUser'), { title: t('auth.incompleteConnection'), variant: 'warning' });
       (document.getElementById(!host ? 'host' : 'username') as HTMLInputElement)?.focus();
+      return;
+    }
+
+    if (port === null) {
+      notify(t('auth.validationPort'), { title: t('auth.incompleteConnection'), variant: 'warning' });
+      portInput.focus();
       return;
     }
 
