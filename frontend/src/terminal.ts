@@ -5,7 +5,9 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SearchAddon } from '@xterm/addon-search';
 import { TrzszFilter } from 'trzsz';
 import '@xterm/xterm/css/xterm.css';
+import { copyTextToClipboard } from './clipboard';
 import { t } from './i18n';
+import { notify } from './ui-feedback';
 import { centerTerminalText } from './terminal-text';
 import { localizedSSHMessage } from './terminal-status';
 import {
@@ -88,6 +90,13 @@ export class SSHTerminal {
     this.selectionPointerActive = false;
     this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
     this.notifySelectionChanged();
+    const selection = this.terminal.getSelection();
+    if (selection) {
+      void this.copySelectionToClipboard(selection);
+    }
+  };
+  private readonly selectionPointerCancelListener = (): void => {
+    this.selectionPointerActive = false;
   };
 
   constructor(containerId: string) {
@@ -121,7 +130,7 @@ export class SSHTerminal {
     this.container.addEventListener('pointerdown', this.selectionPointerDownListener, true);
     this.container.addEventListener('pointermove', this.selectionPointerMoveListener, true);
     window.addEventListener('pointerup', this.selectionPointerUpListener, true);
-    window.addEventListener('pointercancel', this.selectionPointerUpListener, true);
+    window.addEventListener('pointercancel', this.selectionPointerCancelListener, true);
 
     // Ctrl+Shift+F to toggle search bar
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -139,7 +148,7 @@ export class SSHTerminal {
 
     window.addEventListener('resize', this.resizeListener);
 
-    // Right-click paste support
+    // 右键粘贴（选区已通过鼠标松手自动复制到剪贴板）
     this.container.addEventListener('contextmenu', async (e) => {
       e.preventDefault();
       try {
@@ -224,6 +233,16 @@ export class SSHTerminal {
       this.selectionAnchor = null;
     }
     this.onSelectionChanged?.(selection, this.selectionAnchor);
+  }
+
+  /** 将选中文字写入剪贴板，并按实际复制结果提供反馈。 */
+  private async copySelectionToClipboard(text: string): Promise<void> {
+    const copied = await copyTextToClipboard(text);
+    if (!copied) {
+      notify(t('terminal.copyFailed'), { variant: 'danger' });
+      return;
+    }
+    notify(t('terminal.copySuccess'), { variant: 'success', duration: 1500 });
   }
 
   mount(): void {
@@ -705,7 +724,7 @@ export class SSHTerminal {
     this.container.removeEventListener('pointerdown', this.selectionPointerDownListener, true);
     this.container.removeEventListener('pointermove', this.selectionPointerMoveListener, true);
     window.removeEventListener('pointerup', this.selectionPointerUpListener, true);
-    window.removeEventListener('pointercancel', this.selectionPointerUpListener, true);
+    window.removeEventListener('pointercancel', this.selectionPointerCancelListener, true);
     this.themeCleanup();
     this.terminalDisposables.forEach(d => d.dispose());
     this.terminalDisposables = [];
