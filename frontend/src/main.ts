@@ -2,7 +2,8 @@ import {
   applyBuiltInTheme,
   applyImportedTheme,
   isBuiltInTheme,
-  type ImportedThemeData,
+  normalizeImportedTheme,
+  THEME_MAX_BYTES,
 } from './theme';
 import type { SSHTerminal } from './terminal';
 import { ConnectionForm } from './auth-form';
@@ -304,75 +305,87 @@ document.getElementById('export-btn')?.addEventListener('click', () => {
 // ==================== 主题切换 ====================
 
 const CUSTOM_THEME_VALUE = '__custom__';
-const themeSelector = document.getElementById('theme-selector') as HTMLSelectElement | null;
+let themeSelectionRevision = 0;
+const themeSelectors = Array.from(
+  document.querySelectorAll<HTMLSelectElement>('[data-theme-selector]'),
+);
 
-themeSelector?.addEventListener('change', (e) => {
-  const value = (e.target as HTMLSelectElement).value;
-  if (value === CUSTOM_THEME_VALUE) {
-    const importedRaw = localStorage.getItem('cloudssh_imported_theme');
-    if (importedRaw) {
-      try {
-        applyImportedTheme(JSON.parse(importedRaw) as ImportedThemeData);
-      } catch { /* ignore */ }
+themeSelectors.forEach((selector) => {
+  selector.addEventListener('change', (e) => {
+    themeSelectionRevision++;
+    const value = (e.target as HTMLSelectElement).value;
+    if (value === CUSTOM_THEME_VALUE) {
+      const importedRaw = localStorage.getItem('cloudssh_imported_theme');
+      if (importedRaw) {
+        try {
+          const imported = normalizeImportedTheme(JSON.parse(importedRaw));
+          if (imported) applyImportedTheme(imported);
+        } catch { /* ignore */ }
+      }
+    } else if (isBuiltInTheme(value)) {
+      applyBuiltInTheme(value);
     }
-  } else if (isBuiltInTheme(value)) {
-    applyBuiltInTheme(value);
-  }
-  localStorage.setItem('cloudssh_theme_selection', value);
+    syncThemeSelectors(value);
+    localStorage.setItem('cloudssh_theme_selection', value);
+  });
 });
 
 function ensureCustomOption(): void {
-  if (!themeSelector) return;
-  if (!themeSelector.querySelector(`option[value="${CUSTOM_THEME_VALUE}"]`)) {
-    const opt = document.createElement('option');
-    opt.value = CUSTOM_THEME_VALUE;
-    opt.textContent = t('theme.custom');
-    themeSelector.insertBefore(opt, themeSelector.firstChild);
-  }
+  themeSelectors.forEach((selector) => {
+    let option = selector.querySelector<HTMLOptionElement>(`option[value="${CUSTOM_THEME_VALUE}"]`);
+    if (!option) {
+      option = document.createElement('option');
+      option.value = CUSTOM_THEME_VALUE;
+      selector.insertBefore(option, selector.firstChild);
+    }
+    option.textContent = t('theme.custom');
+  });
+}
+
+function syncThemeSelectors(value: string): void {
+  themeSelectors.forEach((selector) => {
+    selector.value = value;
+  });
 }
 
 // ==================== 主题导入 ====================
 
-const importThemeBtn = document.getElementById('import-theme-btn');
+const importThemeButtons = document.querySelectorAll<HTMLElement>('[data-theme-import]');
 const importThemeInput = document.getElementById('import-theme-input') as HTMLInputElement | null;
 
-importThemeBtn?.addEventListener('click', () => {
-  importThemeInput?.click();
+importThemeButtons.forEach((button) => {
+  button.addEventListener('click', () => importThemeInput?.click());
 });
 
-importThemeInput?.addEventListener('change', async (e) => {
+importThemeInput?.addEventListener('change', (e) => {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
+  if (file.size > THEME_MAX_BYTES) {
+    notify(t('theme.importFailed'), { title: t('theme.importTitle'), variant: 'danger' });
+    importThemeInput.value = '';
+    return;
+  }
 
   const reader = new FileReader();
   reader.onload = async (ev) => {
     try {
-      const data = JSON.parse(ev.target!.result as string);
-      if (!data.ui || typeof data.ui !== 'object') {
-        notify(t('theme.missingUi'), { title: t('theme.importTitle'), variant: 'danger' });
+      const data = normalizeImportedTheme(JSON.parse(ev.target!.result as string));
+      if (!data) {
+        notify(t('theme.importFailed'), { title: t('theme.importTitle'), variant: 'danger' });
         return;
       }
 
-      // 保存到 localStorage
       localStorage.setItem('cloudssh_imported_theme', JSON.stringify(data));
-
-      // 尝试保存到云端
-      try {
-        await fetch('/api/user/theme', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ theme_data: data }),
-        });
-      } catch { /* 未登录或网络错误，忽略 */ }
-
-      // 添加 Custom 选项并选中
+      themeSelectionRevision++;
       ensureCustomOption();
-      if (themeSelector) themeSelector.value = CUSTOM_THEME_VALUE;
+      syncThemeSelectors(CUSTOM_THEME_VALUE);
       localStorage.setItem('cloudssh_theme_selection', CUSTOM_THEME_VALUE);
 
-      // 直接应用主题，不刷新页面（避免断开 WebSocket）
-      applyImportedTheme(data as ImportedThemeData);
+      applyImportedTheme(data);
       notify(t('theme.importSuccess'), { variant: 'success' });
+      if (isLoggedIn && !(await saveThemeToCloud(data))) {
+        notify(t('theme.syncFailed'), { title: t('feedback.warning'), variant: 'warning' });
+      }
     } catch {
       notify(t('theme.invalidJson'), { title: t('theme.importTitle'), variant: 'danger' });
     }
@@ -384,67 +397,86 @@ importThemeInput?.addEventListener('change', async (e) => {
 // ==================== 主题恢复 ====================
 
 /** 恢复主题（在 init 时调用，此时还没有终端实例，只设置 UI 变量） */
-async function restoreTheme(): Promise<void> {
+function restoreTheme(): void {
   const selection = localStorage.getItem('cloudssh_theme_selection');
   localStorage.removeItem('cloudssh_theme');
 
-  // 先同步应用本地选择，避免等待云端主题期间出现颜色闪烁。
   if (isBuiltInTheme(selection)) {
     applyBuiltInTheme(selection);
-    if (themeSelector) themeSelector.value = selection;
-  } else if (selection === CUSTOM_THEME_VALUE) {
-    const localRaw = localStorage.getItem('cloudssh_imported_theme');
-    if (localRaw) {
-      try {
-        applyImportedTheme(JSON.parse(localRaw) as ImportedThemeData);
-      } catch { /* 云端加载后会再次校验，失败则回退默认主题 */ }
-    }
-  } else {
-    applyBuiltInTheme('cyberpunk');
-    if (themeSelector) themeSelector.value = 'cyberpunk';
+    syncThemeSelectors(selection);
+    return;
   }
 
-  // 尝试从云端加载自定义主题
-  let cloudTheme: ImportedThemeData | null = null;
-  try {
-    const res = await fetch('/api/user/theme');
-    if (res.ok) {
-      const { theme } = await res.json() as { theme: ImportedThemeData | null };
-      if (theme) {
-        cloudTheme = theme;
-        // 同步到 localStorage
-        localStorage.setItem('cloudssh_imported_theme', JSON.stringify(theme));
-        ensureCustomOption();
-      }
-    }
-  } catch { /* 未登录，忽略 */ }
-
-  // 如果云端没有但 localStorage 有，也添加 Custom 选项
-  if (!cloudTheme) {
-    const localRaw = localStorage.getItem('cloudssh_imported_theme');
-    if (localRaw) {
-      try {
-        JSON.parse(localRaw);
-        ensureCustomOption();
-      } catch {
-        localStorage.removeItem('cloudssh_imported_theme');
-      }
-    }
-  }
-
-  // 恢复选择：应用 UI 变量（终端主题在创建标签时应用）
-  if (selection === CUSTOM_THEME_VALUE) {
-    const raw = localStorage.getItem('cloudssh_imported_theme');
-    if (raw) {
-      try {
-        applyImportedTheme(JSON.parse(raw) as ImportedThemeData);
-        if (themeSelector) themeSelector.value = CUSTOM_THEME_VALUE;
+  const raw = localStorage.getItem('cloudssh_imported_theme');
+  if (raw) {
+    try {
+      const theme = normalizeImportedTheme(JSON.parse(raw));
+      if (!theme) throw new Error('Invalid theme');
+      localStorage.setItem('cloudssh_imported_theme', JSON.stringify(theme));
+      ensureCustomOption();
+      if (selection === CUSTOM_THEME_VALUE) {
+        applyImportedTheme(theme);
+        syncThemeSelectors(CUSTOM_THEME_VALUE);
         return;
-      } catch { /* ignore */ }
+      }
+    } catch {
+      localStorage.removeItem('cloudssh_imported_theme');
     }
-    localStorage.setItem('cloudssh_theme_selection', 'cyberpunk');
-    applyBuiltInTheme('cyberpunk');
-    if (themeSelector) themeSelector.value = 'cyberpunk';
+  }
+
+  localStorage.setItem('cloudssh_theme_selection', 'cyberpunk');
+  applyBuiltInTheme('cyberpunk');
+  syncThemeSelectors('cyberpunk');
+}
+
+async function saveThemeToCloud(theme: ReturnType<typeof normalizeImportedTheme>): Promise<boolean> {
+  if (!theme) return false;
+  try {
+    const response = await fetch('/api/user/theme', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme_data: theme }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 登录后恢复账号主题。新浏览器没有本地选择时自动启用云端主题；
+ * 已明确选择内置主题的当前浏览器只缓存云端主题，不强制覆盖本地选择。
+ */
+async function restoreCloudTheme(
+  initialSelection: string | null,
+  expectedSelectionRevision: number,
+): Promise<void> {
+  try {
+    const response = await fetch('/api/user/theme');
+    if (!response.ok) return;
+    const payload = await response.json() as { theme?: unknown };
+    const cloudTheme = normalizeImportedTheme(payload.theme);
+
+    if (cloudTheme) {
+      // 用户已在请求期间切换或导入主题时，不用较旧的云端响应覆盖当前操作。
+      if (themeSelectionRevision !== expectedSelectionRevision) return;
+      localStorage.setItem('cloudssh_imported_theme', JSON.stringify(cloudTheme));
+      ensureCustomOption();
+      if (initialSelection === null || initialSelection === CUSTOM_THEME_VALUE) {
+        localStorage.setItem('cloudssh_theme_selection', CUSTOM_THEME_VALUE);
+        applyImportedTheme(cloudTheme);
+        syncThemeSelectors(CUSTOM_THEME_VALUE);
+      }
+      return;
+    }
+
+    // 匿名状态下已导入的本地主题，在首次登录后补充同步到账号。
+    const localRaw = localStorage.getItem('cloudssh_imported_theme');
+    if (!localRaw) return;
+    const localTheme = normalizeImportedTheme(JSON.parse(localRaw));
+    if (localTheme) await saveThemeToCloud(localTheme);
+  } catch {
+    // 云端不可用时继续使用本地主题，不影响 SSH 主流程。
   }
 }
 
@@ -453,12 +485,11 @@ async function restoreTheme(): Promise<void> {
 async function init(): Promise<void> {
   initI18n();
   onLocaleChange(() => {
-    ensureCustomOption();
-    const customOption = themeSelector?.querySelector<HTMLOptionElement>(`option[value="${CUSTOM_THEME_VALUE}"]`);
-    if (customOption) customOption.textContent = t('theme.custom');
+    if (localStorage.getItem('cloudssh_imported_theme')) ensureCustomOption();
     tabManager?.refreshTranslations();
   });
-  await restoreTheme();
+  const initialThemeSelection = localStorage.getItem('cloudssh_theme_selection');
+  restoreTheme();
   // 设置版权年份
   const copyrightYearSpan = document.getElementById('copyright-year');
   if (copyrightYearSpan) {
@@ -477,6 +508,7 @@ async function init(): Promise<void> {
     if (meRes.ok) {
       const user = await meRes.json();
       showUserSpace(user);
+      void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
       return;
     }
   } catch {

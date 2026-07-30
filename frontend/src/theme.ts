@@ -1,13 +1,110 @@
 import type { ITheme } from '@xterm/xterm';
+import {
+  THEME_MAX_BYTES,
+  THEME_SCHEMA_VERSION,
+  normalizeThemeData,
+  type BuiltInThemeName,
+  type ColorScheme,
+  type NormalizedThemeData,
+  type ThemeAppearance,
+  type ThemeComponentStyles,
+  type ThemeDensity,
+  type ThemeFont,
+  type ThemeMotion,
+  type ThemeShadow,
+  type ThemeShape,
+  type UIStylePresetName,
+} from '../../src/theme-schema';
 
-export type ColorScheme = 'dark' | 'light';
+export {
+  THEME_MAX_BYTES,
+  THEME_SCHEMA_VERSION,
+  type BuiltInThemeName,
+  type ColorScheme,
+  type ThemeAppearance,
+  type ThemeComponentStyles,
+  type ThemeDensity,
+  type ThemeFont,
+  type ThemeMotion,
+  type ThemeShadow,
+  type ThemeShape,
+  type UIStylePresetName,
+} from '../../src/theme-schema';
 
-export interface ImportedThemeData {
-  name?: string;
+export interface ResolvedThemeAppearance {
+  style: UIStylePresetName;
+  shape: ThemeShape;
+  density: ThemeDensity;
+  font: ThemeFont;
+  shadow: ThemeShadow;
+  motion: ThemeMotion;
+  components: ThemeComponentStyles;
+}
+
+export type ImportedThemeData = Omit<NormalizedThemeData, 'schemaVersion' | 'colorScheme' | 'terminal'> & {
+  schemaVersion?: number;
   colorScheme?: ColorScheme;
   terminal?: ITheme;
-  ui?: Record<string, string>;
-}
+};
+
+export const UI_STYLE_PRESETS: Record<UIStylePresetName, ResolvedThemeAppearance> = {
+  standard: {
+    style: 'standard',
+    shape: 'rounded',
+    density: 'comfortable',
+    font: 'system',
+    shadow: 'subtle',
+    motion: 'reduced',
+    components: {
+      button: 'solid',
+      input: 'boxed',
+      card: 'outlined',
+      tabs: 'underline',
+    },
+  },
+  cyberpunk: {
+    style: 'cyberpunk',
+    shape: 'square',
+    density: 'compact',
+    font: 'mono',
+    shadow: 'none',
+    motion: 'full',
+    components: {
+      button: 'outline',
+      input: 'underline',
+      card: 'outlined',
+      tabs: 'underline',
+    },
+  },
+  soft: {
+    style: 'soft',
+    shape: 'soft',
+    density: 'comfortable',
+    font: 'system',
+    shadow: 'elevated',
+    motion: 'reduced',
+    components: {
+      button: 'soft',
+      input: 'boxed',
+      card: 'elevated',
+      tabs: 'segmented',
+    },
+  },
+  dense: {
+    style: 'dense',
+    shape: 'rounded',
+    density: 'compact',
+    font: 'mono',
+    shadow: 'none',
+    motion: 'reduced',
+    components: {
+      button: 'outline',
+      input: 'boxed',
+      card: 'flat',
+      tabs: 'segmented',
+    },
+  },
+};
 
 export const THEMES = {
   'standard-dark': {
@@ -81,8 +178,6 @@ export const THEMES = {
     selectionBackground: '#504945',
   },
 } satisfies Record<string, ITheme>;
-
-export type BuiltInThemeName = keyof typeof THEMES;
 
 export const UI_THEMES: Record<BuiltInThemeName, Record<string, string>> = {
   'standard-dark': {
@@ -232,6 +327,14 @@ export const UI_THEMES: Record<BuiltInThemeName, Record<string, string>> = {
   },
 };
 
+export const BUILT_IN_APPEARANCE: Record<BuiltInThemeName, ThemeAppearance> = {
+  'standard-dark': { style: 'standard' },
+  'standard-light': { style: 'standard' },
+  cyberpunk: { style: 'cyberpunk' },
+  glacier: { style: 'soft' },
+  gruvbox: { style: 'dense' },
+};
+
 const COLOR_SCHEMES: Record<BuiltInThemeName, ColorScheme> = {
   'standard-dark': 'dark',
   'standard-light': 'light',
@@ -242,6 +345,7 @@ const COLOR_SCHEMES: Record<BuiltInThemeName, ColorScheme> = {
 
 let activeTerminalTheme: ITheme = THEMES.cyberpunk;
 let activeColorScheme: ColorScheme = 'dark';
+let activeAppearance: ResolvedThemeAppearance = UI_STYLE_PRESETS.cyberpunk;
 const terminalThemeListeners = new Set<(theme: ITheme) => void>();
 const colorSchemeListeners = new Set<(colorScheme: ColorScheme) => void>();
 
@@ -250,17 +354,30 @@ export function isBuiltInTheme(value: string | null): value is BuiltInThemeName 
 }
 
 export function applyBuiltInTheme(themeName: BuiltInThemeName): void {
-  applyTheme(UI_THEMES[themeName], THEMES[themeName], COLOR_SCHEMES[themeName], themeName);
+  applyTheme(
+    UI_THEMES[themeName],
+    THEMES[themeName],
+    COLOR_SCHEMES[themeName],
+    themeName,
+    resolveThemeAppearance(BUILT_IN_APPEARANCE[themeName]),
+  );
 }
 
 export function applyImportedTheme(data: ImportedThemeData): void {
-  const colorScheme = data.colorScheme || inferColorScheme(data);
-  const fallbackName: BuiltInThemeName = colorScheme === 'light' ? 'standard-light' : 'cyberpunk';
-  const validUiEntries = Object.entries(data.ui || {})
-    .filter(([property, value]) => property.startsWith('--') && typeof value === 'string');
-  const ui = { ...UI_THEMES[fallbackName], ...Object.fromEntries(validUiEntries) };
-  const terminal = { ...THEMES[fallbackName], ...(data.terminal || {}) };
-  applyTheme(ui, terminal, colorScheme, 'custom');
+  const normalized = normalizeImportedTheme(data);
+  if (!normalized) return;
+  const colorScheme = normalized.colorScheme ?? 'dark';
+  const fallbackName = normalized.baseTheme
+    || (colorScheme === 'light' ? 'standard-light' : 'cyberpunk');
+  const ui = { ...UI_THEMES[fallbackName], ...normalized.ui };
+  const terminal = { ...THEMES[fallbackName], ...normalized.terminal };
+  const fallbackAppearance = resolveThemeAppearance(BUILT_IN_APPEARANCE[fallbackName]);
+  const appearance = resolveThemeAppearance(normalized.appearance, fallbackAppearance);
+  applyTheme(ui, terminal, colorScheme, 'custom', appearance);
+}
+
+export function normalizeImportedTheme(data: unknown): ImportedThemeData | null {
+  return normalizeThemeData(data) as ImportedThemeData | null;
 }
 
 export function getActiveTerminalTheme(): ITheme {
@@ -269,6 +386,10 @@ export function getActiveTerminalTheme(): ITheme {
 
 export function getActiveColorScheme(): ColorScheme {
   return activeColorScheme;
+}
+
+export function getActiveThemeAppearance(): ResolvedThemeAppearance {
+  return activeAppearance;
 }
 
 export function onTerminalThemeChange(listener: (theme: ITheme) => void): () => void {
@@ -288,15 +409,27 @@ function applyTheme(
   terminal: ITheme,
   colorScheme: ColorScheme,
   themeName: BuiltInThemeName | 'custom',
+  appearance: ResolvedThemeAppearance,
 ): void {
   activeTerminalTheme = terminal;
   activeColorScheme = colorScheme;
+  activeAppearance = appearance;
 
   if (typeof document !== 'undefined') {
     const root = document.documentElement;
     Object.entries(ui).forEach(([property, value]) => root.style.setProperty(property, value));
     root.dataset.theme = themeName;
     root.dataset.colorScheme = colorScheme;
+    root.dataset.uiStyle = appearance.style;
+    root.dataset.uiShape = appearance.shape;
+    root.dataset.uiDensity = appearance.density;
+    root.dataset.uiFont = appearance.font;
+    root.dataset.uiShadow = appearance.shadow;
+    root.dataset.uiMotion = appearance.motion;
+    root.dataset.componentButton = appearance.components.button;
+    root.dataset.componentInput = appearance.components.input;
+    root.dataset.componentCard = appearance.components.card;
+    root.dataset.componentTabs = appearance.components.tabs;
     root.style.colorScheme = colorScheme;
     root.classList.toggle('dark', colorScheme === 'dark');
   }
@@ -305,13 +438,49 @@ function applyTheme(
   colorSchemeListeners.forEach(listener => listener(colorScheme));
 }
 
-function inferColorScheme(data: ImportedThemeData): ColorScheme {
-  const background = data.ui?.['--bg'] || data.terminal?.background;
-  if (!background || !/^#[0-9a-f]{6}$/i.test(background)) return 'dark';
+export function resolveThemeAppearance(
+  appearance?: ThemeAppearance,
+  fallback: ResolvedThemeAppearance = UI_STYLE_PRESETS.cyberpunk,
+): ResolvedThemeAppearance {
+  const requestedStyle = isUIStylePresetName(appearance?.style)
+    ? appearance.style
+    : fallback.style;
+  const preset = UI_STYLE_PRESETS[requestedStyle];
 
-  const channels = background.slice(1).match(/.{2}/g)!.map(value => parseInt(value, 16) / 255);
-  const luminance = channels
-    .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
-    .reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
-  return luminance > 0.5 ? 'light' : 'dark';
+  return {
+    style: requestedStyle,
+    shape: isOneOf(appearance?.shape, ['square', 'rounded', 'soft']) ? appearance.shape : preset.shape,
+    density: isOneOf(appearance?.density, ['compact', 'comfortable', 'spacious'])
+      ? appearance.density
+      : preset.density,
+    font: isOneOf(appearance?.font, ['mono', 'system']) ? appearance.font : preset.font,
+    shadow: isOneOf(appearance?.shadow, ['none', 'subtle', 'elevated'])
+      ? appearance.shadow
+      : preset.shadow,
+    motion: isOneOf(appearance?.motion, ['none', 'reduced', 'full'])
+      ? appearance.motion
+      : preset.motion,
+    components: {
+      button: isOneOf(appearance?.components?.button, ['outline', 'solid', 'soft'])
+        ? appearance.components.button
+        : preset.components.button,
+      input: isOneOf(appearance?.components?.input, ['underline', 'boxed'])
+        ? appearance.components.input
+        : preset.components.input,
+      card: isOneOf(appearance?.components?.card, ['outlined', 'flat', 'elevated'])
+        ? appearance.components.card
+        : preset.components.card,
+      tabs: isOneOf(appearance?.components?.tabs, ['underline', 'segmented'])
+        ? appearance.components.tabs
+        : preset.components.tabs,
+    },
+  };
+}
+
+function isUIStylePresetName(value: unknown): value is UIStylePresetName {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(UI_STYLE_PRESETS, value);
+}
+
+function isOneOf<T extends string>(value: unknown, values: readonly T[]): value is T {
+  return typeof value === 'string' && values.includes(value as T);
 }

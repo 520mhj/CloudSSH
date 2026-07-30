@@ -161,11 +161,6 @@ export class UserDBDO {
         return this.handleConnectServer(parseInt(connectMatch[1]), request);
       }
 
-      // --- One-time-token 消费 ---
-      if (path === '/internal/connect-token/consume' && request.method === 'POST') {
-        return this.handleConsumeToken(request);
-      }
-
       // --- 用户自定义主题 ---
       if (path === '/internal/theme' && request.method === 'GET') {
         const userIdStr = url.searchParams.get('user_id');
@@ -176,6 +171,10 @@ export class UserDBDO {
       }
       if (path === '/internal/theme' && request.method === 'PUT') {
         return this.handlePutTheme(request);
+      }
+      // --- One-time-token 消费 ---
+      if (path === '/internal/connect-token/consume' && request.method === 'POST') {
+        return this.handleConsumeToken(request);
       }
 
       // --- known_hosts 管理 ---
