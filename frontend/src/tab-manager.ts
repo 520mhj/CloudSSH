@@ -3,6 +3,9 @@ import { SFTPPanel } from './sftp-panel';
 import { AgentPanel } from './agent/agent-panel';
 import { t } from './i18n';
 import { getNetworkQuality } from './network-quality';
+import { copyTextToClipboard } from './clipboard';
+import { notify } from './ui-feedback';
+import { maskIPAddress } from './host-display';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
 
@@ -407,7 +410,28 @@ export class TabManager {
     const statusText = document.getElementById('status-text');
 
     if (tab.hostInfo) {
-      if (termHost) termHost.textContent = t('terminal.host', { value: tab.hostInfo.host });
+      if (termHost) {
+        const masked = maskIPAddress(tab.hostInfo.host);
+        if (masked) {
+          const copyIPLabel = this.escapeAttr(t('terminal.clickToCopyIP'));
+          termHost.innerHTML = `${t('terminal.hostLabel')}<button type="button" class="host-ip-badge" title="${copyIPLabel}" aria-label="${copyIPLabel}">${this.escapeHtml(masked)}</button>`;
+          const badge = termHost.querySelector('.host-ip-badge') as HTMLButtonElement | null;
+          if (badge) {
+            badge.addEventListener('click', async () => {
+              const ok = await copyTextToClipboard(tab.hostInfo!.host);
+              if (ok) {
+                badge.classList.add('host-ip-copied');
+                setTimeout(() => badge.classList.remove('host-ip-copied'), 800);
+                notify(t('terminal.ipCopied'), { variant: 'success', duration: 1500 });
+              } else {
+                notify(t('terminal.ipCopyFailed'), { variant: 'danger' });
+              }
+            });
+          }
+        } else {
+          termHost.textContent = t('terminal.host', { value: tab.hostInfo.host });
+        }
+      }
       if (termUser) termUser.textContent = tab.hostInfo.username ? t('terminal.user', { value: tab.hostInfo.username }) : '';
       if (termPort) termPort.textContent = t('terminal.port', { value: tab.hostInfo.port });
     } else {
@@ -493,5 +517,9 @@ export class TabManager {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  }
+
+  private escapeAttr(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 }
