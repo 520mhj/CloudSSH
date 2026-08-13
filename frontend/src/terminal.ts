@@ -94,6 +94,12 @@ interface MobileScrollGesture {
 
 const MOBILE_SCROLL_START_THRESHOLD_PX = 10;
 const MOBILE_VIEWPORT_QUERY = '(max-width: 767px), (max-width: 1180px) and (pointer: coarse)';
+const MOBILE_CONNECTION_RECOVERY_QUERY = '(pointer: coarse)';
+
+function supportsMobileConnectionRecovery(): boolean {
+  return navigator.maxTouchPoints > 0
+    && (window.matchMedia?.(MOBILE_CONNECTION_RECOVERY_QUERY).matches ?? false);
+}
 
 export class SSHTerminal {
   private terminal: Terminal;
@@ -146,6 +152,7 @@ export class SSHTerminal {
   private imePendingHandled = false;
   private imeKeyupTimer: ReturnType<typeof setTimeout> | null = null;
   private viewportRestoreFrame: number | null = null;
+  private readonly mobileConnectionRecoveryEnabled: boolean;
   private readonly contextMenuPasteListener = async (event: MouseEvent): Promise<void> => {
     if (window.matchMedia?.('(pointer: coarse)').matches) return;
     event.preventDefault();
@@ -239,6 +246,9 @@ export class SSHTerminal {
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
+    // 桌面浏览器切换标签页也会触发 visibilitychange，但通常不会挂起网络栈。
+    // 仅在手机/平板这类以触摸为主的环境监听后台恢复，避免无意义的探测和日志。
+    this.mobileConnectionRecoveryEnabled = supportsMobileConnectionRecovery();
     this.resizeListener = () => {
       // visualViewport 的连续变化由 MobileTerminalController 稳定后统一处理，
       // 桌面端和不支持 visualViewport 的浏览器仍保留直接适配。
@@ -291,8 +301,10 @@ export class SSHTerminal {
     });
 
     window.addEventListener('resize', this.resizeListener);
-    document.addEventListener('visibilitychange', this.visibilityChangeListener);
-    window.addEventListener('pageshow', this.pageShowListener);
+    if (this.mobileConnectionRecoveryEnabled) {
+      document.addEventListener('visibilitychange', this.visibilityChangeListener);
+      window.addEventListener('pageshow', this.pageShowListener);
+    }
     window.addEventListener('online', this.onlineListener);
 
     // 右键粘贴（选区已通过鼠标松手自动复制到剪贴板）
@@ -687,9 +699,11 @@ export class SSHTerminal {
 
   // ==================== known_hosts (TOFU) ====================
 
-  private handleHostKey(fingerprint: string): void {
+  private handleHostKey(fingerprint: string, host?: string, port?: number): void {
     if (!this.lastConfig) return;
-    const key = `${this.lastConfig.host}:${this.lastConfig.port}`;
+    const knownHost = host || this.lastConfig.host;
+    const knownPort = Number.isInteger(port) ? port! : this.lastConfig.port;
+    const key = `${knownHost}:${knownPort}`;
 
     // 存储到 localStorage（匿名用户）
     try {
@@ -704,8 +718,8 @@ export class SSHTerminal {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        host: this.lastConfig.host,
-        port: this.lastConfig.port,
+        host: knownHost,
+        port: knownPort,
         fingerprint,
       }),
     }).catch(() => { /* 未登录或网络错误，忽略 */ });
@@ -878,7 +892,7 @@ export class SSHTerminal {
               this.terminal.writeln(`\x1b[90m[DEBUG] ${msg.message}\x1b[0m`);
               break;
             case 'host_key':
-              this.handleHostKey(msg.fingerprint);
+              this.handleHostKey(msg.fingerprint, msg.host, msg.port);
               break;
             case 'pong':
               this.handleHeartbeatResponse(msg);
@@ -959,10 +973,20 @@ export class SSHTerminal {
   private handleAuthChallenge(socket: WebSocket, payload: unknown): void {
     if (socket !== this.ws) return;
 
+    const challengeTarget = typeof payload === 'object' && payload !== null
+      ? payload as { host?: unknown; port?: unknown }
+      : {};
+    const challengeHost = typeof challengeTarget.host === 'string'
+      ? challengeTarget.host
+      : this.lastConfig?.host ?? '';
+    const challengePort = typeof challengeTarget.port === 'number' && Number.isInteger(challengeTarget.port)
+      ? challengeTarget.port
+      : this.lastConfig?.port ?? 22;
+
     this.authChallengeDialog ??= new AuthChallengeDialog();
     const shown = this.authChallengeDialog.show(payload, {
-      host: this.lastConfig?.host ?? '',
-      port: this.lastConfig?.port ?? 22,
+      host: challengeHost,
+      port: challengePort,
       onShown: (id: string) => {
         if (socket !== this.ws || socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({ type: 'auth_challenge_ack', id }));
@@ -1351,8 +1375,10 @@ export class SSHTerminal {
     this.authChallengeDialog?.destroy();
     this.authChallengeDialog = null;
     window.removeEventListener('resize', this.resizeListener);
-    document.removeEventListener('visibilitychange', this.visibilityChangeListener);
-    window.removeEventListener('pageshow', this.pageShowListener);
+    if (this.mobileConnectionRecoveryEnabled) {
+      document.removeEventListener('visibilitychange', this.visibilityChangeListener);
+      window.removeEventListener('pageshow', this.pageShowListener);
+    }
     window.removeEventListener('online', this.onlineListener);
     this.container.removeEventListener('pointerdown', this.selectionPointerDownListener, true);
     this.container.removeEventListener('pointermove', this.selectionPointerMoveListener, true);
