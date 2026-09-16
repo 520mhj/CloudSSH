@@ -478,6 +478,12 @@ html:not([data-fx-flicker='on']) .flicker {
   color: var(--text-dim);
 }
 
+/* 隐藏浏览器在 input 上的原生指示器（如 WebKit datalist 粗黑下三角） */
+#ai-model::-webkit-calendar-picker-indicator {
+  display: none;
+  opacity: 0;
+}
+
 /* Windows Chromium 的原生下拉面板不会可靠继承 select 背景，需要显式适配主题。 */
 select option,
 select optgroup {
@@ -734,6 +740,25 @@ select optgroup {
 
 .agent-table tbody tr:hover {
   background: color-mix(in srgb, var(--agent-agent-color) 8%, transparent);
+}
+
+/* Agent Work Log Summary clamp and expansion */
+.agent-log-summary {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+  transition: color 0.15s ease;
+}
+
+.agent-log-summary.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  overflow: visible;
 }
 
 /* ==================== User Space Styles ==================== */
@@ -1835,9 +1860,9 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
 /* ========== Agent Panel ========== */
 
 #agent-panel {
-  min-width: 280px;
-  width: min(clamp(420px, 40vw, 600px), 100%);
-  max-width: 100%;
+  min-width: 320px;
+  width: min(clamp(420px, 40vw, 600px), 100vw);
+  max-width: 100vw;
   height: 100%;
 }
 
