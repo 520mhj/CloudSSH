@@ -1,26 +1,26 @@
-import {
-  MAX_SERVER_KNOWLEDGE,
-  MAX_SERVER_WORK_LOGS,
-  normalizeBatchDeleteKnowledgeInput,
-  normalizeKnowledgeInput,
-  normalizeWorkLogInput,
-  type ServerKnowledgeItem,
-  type ServerWorkLog,
-  type UnifiedServerMemory,
-} from '../server-memory-schema';
+import { normalizeAIBaseUrl } from '../ai-endpoint';
+import { ServerMemoryStore } from './server-memory-store';
 import { normalizeSnippetInput, SNIPPET_MAX_COUNT } from '../snippet-schema';
+import { normalizeUserThemePayload } from '../theme-schema';
 import {
   ALLOWED_LOCATION_HINTS,
   type Env,
   type SSHConnectionConfig,
   type SSHJumpHostConfig,
 } from '../types';
+import { LOCAL_ADMIN_GITHUB_ID } from './auth';
 import { inferLocationHint } from './ip-geo';
 import { isDetectedOS } from './os-detect';
 import { deserializeServerRow, serializeServerTags } from './server-tags';
+import { isValidTunnelHostname } from './tunnel-stream';
 
 const AUTH_METHODS = new Set(['password', 'publickey']);
 const MAX_JUMP_HOSTS = 3;
+
+// 单管理员密码登录节流（DO 持久化，跨 isolate 权威；指数退避封顶 15 分钟）
+const LOGIN_LOCKOUT_THRESHOLD = 5;
+const LOGIN_LOCKOUT_BASE_SEC = 60;
+const LOGIN_LOCKOUT_MAX_SEC = 15 * 60;
 
 interface StoredServerRow {
   id: number;
@@ -35,6 +35,10 @@ interface StoredServerRow {
   inferred_hint: string | null;
   os: string | null;
   jump_server_id: number | null;
+  transport_type: string | null;
+  cf_tunnel_host: string | null;
+  cf_access_client_id: string | null;
+  cf_access_client_secret: string | null;
 }
 
 // ====== 行形状帮助类型：与 UserDBDO 内各 SELECT 列一一对应（配合 query<T> 消除逐处 as unknown as） ======
@@ -52,10 +56,16 @@ type ServerRow = {
   tags: string;
   os: string | null;
   jump_server_id: number | null;
+  transport_type: string | null;
+  cf_tunnel_host: string | null;
+  cf_access_client_id: string | null;
+  has_cf_access_client_secret: number;
+  last_connected_at: number | null;
   created_at: string;
   updated_at: string;
 };
 type UserIdRow = { user_id: number };
+type LoginThrottleRow = { fail_count: number; locked_until: number; last_fail_at: number };
 type JumpRow = { user_id: number; jump_server_id: number | null };
 type ServerEditRow = {
   user_id: number;
@@ -65,15 +75,33 @@ type ServerEditRow = {
   region: string | null;
   inferred_hint: string | null;
   jump_server_id: number | null;
+  transport_type: string | null;
+  cf_tunnel_host: string | null;
+  cf_access_client_id: string | null;
+  cf_access_client_secret: string | null;
 };
 type ServerNameRow = { name: string };
+
+function formatServerResponse(row: ServerRow) {
+  const { cf_access_client_secret: _unused, ...base } = deserializeServerRow(row) as Record<
+    string,
+    unknown
+  >;
+  return {
+    ...base,
+    transport_type: (row.transport_type === 'cf_tunnel' ? 'cf_tunnel' : 'direct') as
+      | 'direct'
+      | 'cf_tunnel',
+    cf_tunnel_host: row.cf_tunnel_host || null,
+    cf_access_client_id: row.cf_access_client_id || null,
+    has_cf_access_client_secret: Boolean(row.has_cf_access_client_secret),
+  };
+}
 type ShareMetaRow = { user_id: number; server_id: number; share_ref: string; status: string };
 type ThemeRow = { theme_data: string };
 type FingerprintRow = { fingerprint: string };
 type AIConfigRow = { base_url: string; model: string; api_key_last4: string; updated_at: string };
 type AIConfigSecretRow = { base_url: string; model: string; api_key_enc: string };
-type WorkLogRow = ServerWorkLog;
-type KnowledgeRow = ServerKnowledgeItem;
 
 /**
  * UserDBDO — 按 GitHub 用户 ID 命名并隔离的用户数据库 Durable Object
@@ -92,11 +120,17 @@ export class UserDBDO {
     new Map();
   private static readonly MAX_CONNECT_TOKENS = 1000;
   private derivedKeyCache: Map<number, CryptoKey> = new Map();
+  private memoryStore: ServerMemoryStore;
 
   constructor(state: DurableObjectState, env: Env) {
     this.env = env;
     this.db = (state.storage as any).sql;
     this.initSchema();
+    this.memoryStore = new ServerMemoryStore(this.db,
+      callback => typeof (state.storage as any).transactionSync === 'function'
+        ? (state.storage as any).transactionSync(callback) : callback(),
+      (value, userId) => this.encryptCredential(value, userId),
+      (value, userId) => this.decryptCredential(value, userId));
   }
 
   /**
@@ -149,6 +183,11 @@ export class UserDBDO {
         tags        TEXT NOT NULL DEFAULT '[]',
         os          TEXT DEFAULT NULL,
         jump_server_id INTEGER DEFAULT NULL,
+        transport_type TEXT NOT NULL DEFAULT 'direct',
+        cf_tunnel_host TEXT DEFAULT NULL,
+        cf_access_client_id TEXT DEFAULT NULL,
+        cf_access_client_secret TEXT DEFAULT NULL,
+        last_connected_at INTEGER DEFAULT NULL,
         created_at  TEXT DEFAULT (datetime('now')),
         updated_at  TEXT DEFAULT (datetime('now'))
       );
@@ -238,6 +277,13 @@ export class UserDBDO {
       );
       CREATE INDEX IF NOT EXISTS idx_server_knowledge_user_server
         ON server_knowledge(user_id, server_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS login_throttle (
+        id            INTEGER PRIMARY KEY CHECK (id = 1),
+        fail_count    INTEGER NOT NULL DEFAULT 0,
+        locked_until  INTEGER NOT NULL DEFAULT 0,
+        last_fail_at  INTEGER NOT NULL DEFAULT 0
+      );
     `);
 
     // === Migration: 给既有 servers 表追加 region / inferred_hint 列（幂等） ===
@@ -258,7 +304,23 @@ export class UserDBDO {
     if (!serverCols.some((c: any) => c.name === 'jump_server_id')) {
       this.db.exec('ALTER TABLE servers ADD COLUMN jump_server_id INTEGER DEFAULT NULL');
     }
+    if (!serverCols.some((c: any) => c.name === 'transport_type')) {
+      this.db.exec("ALTER TABLE servers ADD COLUMN transport_type TEXT NOT NULL DEFAULT 'direct'");
+    }
+    if (!serverCols.some((c: any) => c.name === 'cf_tunnel_host')) {
+      this.db.exec('ALTER TABLE servers ADD COLUMN cf_tunnel_host TEXT DEFAULT NULL');
+    }
+    if (!serverCols.some((c: any) => c.name === 'cf_access_client_id')) {
+      this.db.exec('ALTER TABLE servers ADD COLUMN cf_access_client_id TEXT DEFAULT NULL');
+    }
+    if (!serverCols.some((c: any) => c.name === 'cf_access_client_secret')) {
+      this.db.exec('ALTER TABLE servers ADD COLUMN cf_access_client_secret TEXT DEFAULT NULL');
+    }
+    if (!serverCols.some((c: any) => c.name === 'last_connected_at')) {
+      this.db.exec('ALTER TABLE servers ADD COLUMN last_connected_at INTEGER DEFAULT NULL');
+    }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_servers_jump ON servers(jump_server_id)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_servers_last_connected ON servers(user_id, last_connected_at DESC)');
 
     // === Migration: 给既有 ssh_shares 表追加审计清理留痕列（幂等） ===
     // SSHShareDO 清理审计后同步写入；管理端据此隐藏查看入口并集中展示清理记录
@@ -289,6 +351,14 @@ export class UserDBDO {
       // --- 用户管理 ---
       if (path === '/internal/oauth-user' && request.method === 'POST') {
         return this.handleOAuthUser(request);
+      }
+
+      // --- 单管理员密码认证（本地管理员 upsert + 登录节流，仅 Worker 内部链路可达） ---
+      if (path === '/internal/local-admin-user' && request.method === 'POST') {
+        return this.handleLocalAdminUser();
+      }
+      if (path === '/internal/login-throttle' && request.method === 'POST') {
+        return this.handleLoginThrottle(request);
       }
 
       // --- Session 管理 ---
@@ -366,11 +436,16 @@ export class UserDBDO {
         return this.handleUpdateServerOS(parseInt(osMatch[1], 10), request);
       }
 
+      const agentMemoryMatch = path.match(/^\/internal\/servers\/(\d+)\/agent-(session|checkpoint)$/);
+      if (agentMemoryMatch && ['GET', 'POST', 'DELETE'].includes(request.method)) {
+        return this.memoryStore.handle(Number(agentMemoryMatch[1]), agentMemoryMatch[2] === 'session' ? 'session' : 'checkpoint', request);
+      }
+
       // /internal/servers/:id/memory/batch
       const batchMemoryMatch = path.match(/^\/internal\/servers\/(\d+)\/memory\/batch$/);
       if (batchMemoryMatch && request.method === 'POST') {
         const serverId = parseInt(batchMemoryMatch[1], 10);
-        return this.handleBatchSaveMemory(serverId, request);
+        return this.memoryStore.handle(serverId, 'batch', request);
       }
 
       // /internal/servers/:id/memory
@@ -379,7 +454,7 @@ export class UserDBDO {
         const serverId = parseInt(memoryMatch[1], 10);
         const userIdStr = url.searchParams.get('user_id');
         if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetServerMemory(serverId, parseInt(userIdStr, 10));
+        return this.memoryStore.handle(serverId, 'memory', request);
       }
 
       // /internal/servers/:id/work-logs/:logId
@@ -389,21 +464,21 @@ export class UserDBDO {
         const logId = parseInt(singleWorkLogMatch[2], 10);
         const userIdStr = url.searchParams.get('user_id');
         if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleDeleteWorkLog(serverId, logId, parseInt(userIdStr, 10));
+        return this.memoryStore.handle(serverId, 'work-log', request, logId);
       }
 
       // /internal/servers/:id/work-logs
       const workLogsMatch = path.match(/^\/internal\/servers\/(\d+)\/work-logs$/);
       if (workLogsMatch && request.method === 'POST') {
         const serverId = parseInt(workLogsMatch[1], 10);
-        return this.handleSaveWorkLog(serverId, request);
+        return this.memoryStore.handle(serverId, 'work-log', request);
       }
 
       // /internal/servers/:id/knowledge/batch
       const batchKnowledgeMatch = path.match(/^\/internal\/servers\/(\d+)\/knowledge\/batch$/);
       if (batchKnowledgeMatch && request.method === 'DELETE') {
         const serverId = parseInt(batchKnowledgeMatch[1], 10);
-        return this.handleBatchDeleteKnowledge(serverId, request);
+        return this.memoryStore.handle(serverId, 'knowledge-batch', request);
       }
 
       // /internal/servers/:id/knowledge/:kId
@@ -413,14 +488,14 @@ export class UserDBDO {
         const kId = parseInt(singleKnowledgeMatch[2], 10);
         const userIdStr = url.searchParams.get('user_id');
         if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleDeleteKnowledge(serverId, kId, parseInt(userIdStr, 10));
+        return this.memoryStore.handle(serverId, 'knowledge', request, kId);
       }
 
       // /internal/servers/:id/knowledge
       const knowledgeMatch = path.match(/^\/internal\/servers\/(\d+)\/knowledge$/);
       if (knowledgeMatch && request.method === 'POST') {
         const serverId = parseInt(knowledgeMatch[1], 10);
-        return this.handleSaveKnowledge(serverId, request);
+        return this.memoryStore.handle(serverId, 'knowledge', request);
       }
 
       // --- 用户自定义主题 ---
@@ -433,6 +508,13 @@ export class UserDBDO {
       }
       if (path === '/internal/theme' && request.method === 'PUT') {
         return this.handlePutTheme(request);
+      }
+      if (path === '/internal/theme' && request.method === 'DELETE') {
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr, 10);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleDeleteTheme(userId, url.searchParams.get('theme_id'));
       }
       // --- One-time-token 消费 ---
       if (path === '/internal/connect-token/consume' && request.method === 'POST') {
@@ -548,10 +630,107 @@ export class UserDBDO {
     return Response.json(newUser);
   }
 
+  // ==================== 本地管理员（单管理员密码模式） ====================
+
+  /**
+   * 幂等 upsert 哨兵用户行（github_id = -1，GitHub ID 恒为正数无碰撞；username 固定 admin）。
+   * 与 handleOAuthUser 同构；首次密码登录时由 Worker 调用，是密码模式下唯一的建用户入口。
+   */
+  private handleLocalAdminUser(): Response {
+    const existing = this.query<UserRow>(
+      'SELECT id, github_id, username, avatar_url FROM users WHERE github_id = ?',
+      LOCAL_ADMIN_GITHUB_ID
+    );
+    if (existing.length > 0) {
+      return Response.json(existing[0]);
+    }
+
+    this.db.exec(
+      'INSERT INTO users (github_id, username, avatar_url) VALUES (?, ?, NULL)',
+      LOCAL_ADMIN_GITHUB_ID,
+      'admin'
+    );
+
+    const newUser = this.query<UserRow>(
+      'SELECT id, github_id, username, avatar_url FROM users WHERE github_id = ?',
+      LOCAL_ADMIN_GITHUB_ID
+    )[0];
+
+    return Response.json(newUser);
+  }
+
+  /**
+   * 登录节流状态机（单行表，id = 1）。
+   * - check：返回当前是否锁定与剩余秒数
+   * - fail：连败计数 +1，达到阈值后指数退避锁定（60s * 2^n，封顶 15 分钟）；
+   *   距上次失败超过锁定封顶时长则视为新一轮（连败衰减）
+   * - reset：登录成功后清零
+   */
+  private async handleLoginThrottle(request: Request): Promise<Response> {
+    const { action } = await request.json<{ action: string }>();
+
+    this.db.exec(
+      'INSERT OR IGNORE INTO login_throttle (id, fail_count, locked_until, last_fail_at) VALUES (1, 0, 0, 0)'
+    );
+
+    if (action === 'check') {
+      const row = this.query<LoginThrottleRow>(
+        'SELECT fail_count, locked_until, last_fail_at FROM login_throttle WHERE id = 1'
+      )[0];
+      const now = Date.now();
+      const lockedUntil = row?.locked_until ?? 0;
+      const locked = lockedUntil > now;
+      return Response.json({
+        locked,
+        retryAfterSec: locked ? Math.ceil((lockedUntil - now) / 1000) : 0,
+      });
+    }
+
+    if (action === 'fail') {
+      const now = Date.now();
+      const row = this.query<LoginThrottleRow>(
+        'SELECT fail_count, locked_until, last_fail_at FROM login_throttle WHERE id = 1'
+      )[0];
+      // 连败衰减：距上次失败超过锁定封顶时长则重新计数
+      const streakExpired = !row || now - row.last_fail_at > LOGIN_LOCKOUT_MAX_SEC * 1000;
+      const failCount = streakExpired ? 1 : row.fail_count + 1;
+
+      let lockedUntil = 0;
+      if (failCount >= LOGIN_LOCKOUT_THRESHOLD) {
+        const backoffSec = Math.min(
+          LOGIN_LOCKOUT_BASE_SEC * 2 ** (failCount - LOGIN_LOCKOUT_THRESHOLD),
+          LOGIN_LOCKOUT_MAX_SEC
+        );
+        lockedUntil = now + backoffSec * 1000;
+      }
+      this.db.exec(
+        'UPDATE login_throttle SET fail_count = ?, locked_until = ?, last_fail_at = ? WHERE id = 1',
+        failCount,
+        lockedUntil,
+        now
+      );
+      const locked = lockedUntil > now;
+      return Response.json({
+        locked,
+        retryAfterSec: locked ? Math.ceil((lockedUntil - now) / 1000) : 0,
+      });
+    }
+
+    if (action === 'reset') {
+      this.db.exec(
+        'UPDATE login_throttle SET fail_count = 0, locked_until = 0, last_fail_at = 0 WHERE id = 1'
+      );
+      return Response.json({ locked: false, retryAfterSec: 0 });
+    }
+
+    return Response.json({ error: 'Invalid action' }, { status: 400 });
+  }
+
   // ==================== Session 管理 ====================
 
   private async handleSessionCreate(request: Request): Promise<Response> {
-    const { user_id } = await request.json<{ user_id: number }>();
+    const body = await request.json<{ user_id: number; token?: string }>();
+    const { user_id } = body;
 
     // 获取 github_id
     const userRows = this.db.exec('SELECT github_id FROM users WHERE id = ?', user_id).toArray();
@@ -560,13 +739,20 @@ export class UserDBDO {
     }
     const github_id = (userRows[0] as any).github_id;
 
-    // 生成 token (github_id:randomHex)
-    const tokenBytes = new Uint8Array(32);
-    crypto.getRandomValues(tokenBytes);
-    const randomHex = Array.from(tokenBytes)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-    const token = `${github_id}:${randomHex}`;
+    // 可信 Worker 预生成的完整令牌（本地管理员路径：-1:<指纹>:<随机>，内嵌密码代际指纹）；
+    // 未提供时沿用 github_id:randomHex 生成（GitHub OAuth 路径）
+    let token: string;
+    if (typeof body.token === 'string' && /^[^:\s]+:[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?$/.test(body.token)) {
+      token = body.token;
+    } else {
+      // 生成 token (github_id:randomHex)
+      const tokenBytes = new Uint8Array(32);
+      crypto.getRandomValues(tokenBytes);
+      const randomHex = Array.from(tokenBytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      token = `${github_id}:${randomHex}`;
+    }
 
     // 7 天过期
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -614,12 +800,16 @@ export class UserDBDO {
 
   private handleGetServers(userId: number): Response {
     const rows = this.query<ServerRow>(
-      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id, created_at, updated_at
-       FROM servers WHERE user_id = ? ORDER BY updated_at DESC`,
+      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id,
+              transport_type, cf_tunnel_host, cf_access_client_id,
+              (cf_access_client_secret IS NOT NULL AND cf_access_client_secret != '') AS has_cf_access_client_secret,
+              last_connected_at, created_at, updated_at
+       FROM servers WHERE user_id = ?
+       ORDER BY (last_connected_at IS NULL) ASC, last_connected_at DESC, updated_at DESC`,
       userId
     );
 
-    return Response.json(rows.map((row) => deserializeServerRow(row)));
+    return Response.json(rows.map((row) => formatServerResponse(row)));
   }
 
   private validateJumpChain(
@@ -665,6 +855,10 @@ export class UserDBDO {
       region?: string;
       tags?: unknown;
       jump_server_id?: number | null;
+      transport_type?: 'direct' | 'cf_tunnel';
+      cf_tunnel_host?: string;
+      cf_access_client_id?: string;
+      cf_access_client_secret?: string;
     }>();
 
     const port = body.port ?? 22;
@@ -678,8 +872,50 @@ export class UserDBDO {
       return Response.json({ error: '认证凭据不能为空' }, { status: 400 });
     }
     const jumpServerId = body.jump_server_id ?? null;
+    const transportType = body.transport_type === 'cf_tunnel' ? 'cf_tunnel' : 'direct';
+
+    if (transportType === 'cf_tunnel' && jumpServerId !== null) {
+      return Response.json({ error: 'Cloudflare 隧道连接不支持跳板机' }, { status: 400 });
+    }
+
     const jumpError = this.validateJumpChain(body.user_id, null, jumpServerId);
     if (jumpError) return Response.json({ error: jumpError }, { status: 400 });
+
+    let cleanTunnelHost: string | null = null;
+    let cfAccessClientId: string | null = null;
+    let encCfAccessClientSecret: string | null = null;
+
+    if (transportType === 'cf_tunnel') {
+      const rawTunnelHost = (body.cf_tunnel_host || body.host || '').trim();
+      cleanTunnelHost = rawTunnelHost
+        .replace(/^(https?|wss?):\/\//i, '')
+        .replace(/\/.*$/, '')
+        .replace(/:\d+$/, '');
+      if (!cleanTunnelHost) {
+        return Response.json({ error: 'Cloudflare 隧道域名不能为空' }, { status: 400 });
+      }
+      if (!isValidTunnelHostname(cleanTunnelHost)) {
+        return Response.json(
+          { error: 'Cloudflare 隧道域名格式不正确，必须为有效的公开域名（例如 ssh.example.com）' },
+          { status: 400 }
+        );
+      }
+      if (!body.host || body.host.trim() === '') {
+        body.host = cleanTunnelHost;
+      }
+      if (typeof body.cf_access_client_id === 'string') {
+        cfAccessClientId = body.cf_access_client_id.trim() || null;
+      }
+      if (
+        typeof body.cf_access_client_secret === 'string' &&
+        body.cf_access_client_secret.trim().length > 0
+      ) {
+        encCfAccessClientSecret = await this.encryptCredential(
+          body.cf_access_client_secret.trim(),
+          body.user_id
+        );
+      }
+    }
 
     const requestedRegion = (ALLOWED_LOCATION_HINTS as readonly string[]).includes(
       body.region || ''
@@ -687,7 +923,7 @@ export class UserDBDO {
       ? body.region || null
       : null;
     // 只有 Cloudflare 直接建立 TCP 连接的跳板链入口需要区域偏好。
-    // 下游节点的区域由最外层入口决定，保存自身区域只会产生误导和无效查询。
+    // 下游节点或隧道连接不需要推断区域。
     const region = jumpServerId === null ? requestedRegion : null;
 
     // 加密凭据
@@ -700,6 +936,8 @@ export class UserDBDO {
     let inferDebug: string[] = [];
     if (jumpServerId !== null) {
       inferDebug.push('[IP-GEO] 当前服务器通过跳板连接，区域由最外层入口决定，跳过推断');
+    } else if (transportType === 'cf_tunnel') {
+      inferDebug.push('[IP-GEO] 当前服务器使用 Cloudflare 隧道连接，跳过推断');
     } else if (region === null) {
       try {
         const result = await inferLocationHint(body.host);
@@ -718,7 +956,11 @@ export class UserDBDO {
     if (currentJumpError) return Response.json({ error: currentJumpError }, { status: 400 });
 
     this.db.exec(
-      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method, region, inferred_hint, tags, jump_server_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO servers (
+        user_id, name, host, port, username, credential, auth_method,
+        region, inferred_hint, tags, jump_server_id,
+        transport_type, cf_tunnel_host, cf_access_client_id, cf_access_client_secret
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       body.user_id,
       body.name,
       body.host,
@@ -729,19 +971,25 @@ export class UserDBDO {
       region,
       inferredHint, // 系统推断值（可 NULL）
       serializeServerTags(body.tags),
-      jumpServerId
+      jumpServerId,
+      transportType,
+      cleanTunnelHost,
+      cfAccessClientId,
+      encCfAccessClientSecret
     );
 
     // 获取新创建的记录
     const rows = this.query<ServerRow>(
-      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id, created_at, updated_at
+      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id,
+              transport_type, cf_tunnel_host, cf_access_client_id,
+              (cf_access_client_secret IS NOT NULL AND cf_access_client_secret != '') AS has_cf_access_client_secret,
+              last_connected_at, created_at, updated_at
        FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
       body.user_id
     );
 
     // DEBUG_MODE 开启时，在响应中附带调试信息
-    // 行形状由上方 SELECT 的 servers 全列定义；deserializeServerRow 归一化 tags 后直接序列化
-    const server = deserializeServerRow(rows[0]);
+    const server = formatServerResponse(rows[0]);
     if (this.env.DEBUG_MODE === 'true') {
       return Response.json({ ...server, _debug: inferDebug }, { status: 201 });
     }
@@ -760,11 +1008,15 @@ export class UserDBDO {
       region?: string;
       tags?: unknown;
       jump_server_id?: number | null;
+      transport_type?: 'direct' | 'cf_tunnel';
+      cf_tunnel_host?: string;
+      cf_access_client_id?: string;
+      cf_access_client_secret?: string | null;
     }>();
 
-    // 验证服务器属于该用户（行形状：user_id/host/port/auth_method/region/inferred_hint/jump_server_id）
+    // 验证服务器属于该用户（行形状：user_id/host/port/auth_method/region/inferred_hint/jump_server_id/transport_type/cf_tunnel_host/cf_access_client_id/cf_access_client_secret）
     const existing = this.query<ServerEditRow>(
-      'SELECT user_id, host, port, auth_method, region, inferred_hint, jump_server_id FROM servers WHERE id = ?',
+      'SELECT user_id, host, port, auth_method, region, inferred_hint, jump_server_id, transport_type, cf_tunnel_host, cf_access_client_id, cf_access_client_secret FROM servers WHERE id = ?',
       serverId
     );
     if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
@@ -788,6 +1040,20 @@ export class UserDBDO {
     }
     const nextJumpServerId =
       body.jump_server_id === undefined ? current.jump_server_id : body.jump_server_id;
+
+    const nextTransportType =
+      body.transport_type !== undefined
+        ? body.transport_type === 'cf_tunnel'
+          ? 'cf_tunnel'
+          : 'direct'
+        : current.transport_type === 'cf_tunnel'
+          ? 'cf_tunnel'
+          : 'direct';
+
+    if (nextTransportType === 'cf_tunnel' && nextJumpServerId !== null) {
+      return Response.json({ error: 'Cloudflare 隧道连接不支持跳板机' }, { status: 400 });
+    }
+
     const jumpError = this.validateJumpChain(body.user_id, serverId, nextJumpServerId);
     if (jumpError) return Response.json({ error: jumpError }, { status: 400 });
 
@@ -803,7 +1069,7 @@ export class UserDBDO {
       requestedRegion = current.region;
     }
     const normalizedRegion = nextJumpServerId === null ? requestedRegion : null;
-    const isDirect = nextJumpServerId === null;
+    const isDirect = nextJumpServerId === null && nextTransportType !== 'cf_tunnel';
     const becameDirect = current.jump_server_id !== null && isDirect;
     const hostChanged = body.host !== undefined && body.host !== current.host;
     const portChanged = body.port !== undefined && body.port !== current.port;
@@ -853,20 +1119,9 @@ export class UserDBDO {
       values.push(body.port);
     }
     if (hostChanged || portChanged) {
-      // 主机地址或端口可能指向另一台 SSH 服务，旧 OS 结果与工作记忆不可继续复用。
+      // MemoryStore detects the complete route change, marks old facts stale and invalidates recovery.
+      // Keep user-owned assets/history rather than deleting them before this update is validated.
       updates.push('os = NULL');
-      try {
-        this.db.exec('DELETE FROM server_memories WHERE server_id = ?', serverId);
-      } catch {
-        /* ignore */
-      }
-      try {
-        this.db.exec('DELETE FROM server_task_checkpoints WHERE server_id = ?', serverId);
-      } catch {
-        /* ignore */
-      }
-      this.db.exec('DELETE FROM server_work_logs WHERE server_id = ?', serverId);
-      this.db.exec('DELETE FROM server_knowledge WHERE server_id = ?', serverId);
     }
     if (body.username !== undefined) {
       updates.push('username = ?');
@@ -881,7 +1136,7 @@ export class UserDBDO {
       updates.push('auth_method = ?');
       values.push(body.auth_method);
     }
-    if (!isDirect && current.region !== null) {
+    if (nextJumpServerId !== null && current.region !== null) {
       updates.push('region = ?');
       values.push(null);
     } else if (body.region !== undefined || becameDirect) {
@@ -898,6 +1153,59 @@ export class UserDBDO {
       values.push(body.jump_server_id);
     }
 
+    if (body.transport_type !== undefined) {
+      updates.push('transport_type = ?');
+      values.push(nextTransportType);
+    }
+
+    if (nextTransportType === 'cf_tunnel') {
+      if (body.cf_tunnel_host !== undefined || (body.host !== undefined && body.cf_tunnel_host === undefined)) {
+        const rawTunnelHost = (body.cf_tunnel_host ?? body.host ?? current.cf_tunnel_host ?? current.host ?? '').trim();
+        const cleanTunnelHost = rawTunnelHost
+          .replace(/^(https?|wss?):\/\//i, '')
+          .replace(/\/.*$/, '')
+          .replace(/:\d+$/, '');
+        if (!cleanTunnelHost) {
+          return Response.json({ error: 'Cloudflare 隧道域名不能为空' }, { status: 400 });
+        }
+        if (!isValidTunnelHostname(cleanTunnelHost)) {
+          return Response.json(
+            { error: 'Cloudflare 隧道域名格式不正确，必须为有效的公开域名（例如 ssh.example.com）' },
+            { status: 400 }
+          );
+        }
+        updates.push('cf_tunnel_host = ?');
+        values.push(cleanTunnelHost);
+      }
+      if (body.cf_access_client_id !== undefined) {
+        updates.push('cf_access_client_id = ?');
+        values.push(body.cf_access_client_id?.trim() || null);
+      }
+      if (body.cf_access_client_secret !== undefined) {
+        if (
+          typeof body.cf_access_client_secret === 'string' &&
+          body.cf_access_client_secret.trim().length > 0
+        ) {
+          const encSecret = await this.encryptCredential(
+            body.cf_access_client_secret.trim(),
+            body.user_id
+          );
+          updates.push('cf_access_client_secret = ?');
+          values.push(encSecret);
+        } else {
+          updates.push('cf_access_client_secret = ?');
+          values.push(null);
+        }
+      }
+    } else if (body.transport_type === 'direct') {
+      updates.push('cf_tunnel_host = ?');
+      values.push(null);
+      updates.push('cf_access_client_id = ?');
+      values.push(null);
+      updates.push('cf_access_client_secret = ?');
+      values.push(null);
+    }
+
     if (updates.length > 0) {
       // Credential encryption and region inference may yield; validate again
       // immediately before the write so concurrent updates cannot create a cycle.
@@ -911,12 +1219,15 @@ export class UserDBDO {
     }
 
     const row = this.query<ServerRow>(
-      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id, created_at, updated_at
+      `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, os, jump_server_id,
+              transport_type, cf_tunnel_host, cf_access_client_id,
+              (cf_access_client_secret IS NOT NULL AND cf_access_client_secret != '') AS has_cf_access_client_secret,
+              last_connected_at, created_at, updated_at
        FROM servers WHERE id = ?`,
       serverId
     );
 
-    return Response.json(deserializeServerRow(row[0]));
+    return Response.json(formatServerResponse(row[0]));
   }
 
   private async handleDeleteServer(serverId: number, request: Request): Promise<Response> {
@@ -969,6 +1280,7 @@ export class UserDBDO {
     }
     this.db.exec('DELETE FROM server_work_logs WHERE server_id = ?', serverId);
     this.db.exec('DELETE FROM server_knowledge WHERE server_id = ?', serverId);
+    this.memoryStore.cleanup(serverId);
     this.db.exec('DELETE FROM servers WHERE id = ?', serverId);
     return Response.json({ success: true });
   }
@@ -1343,16 +1655,24 @@ export class UserDBDO {
     const rows = this.query<ThemeRow>('SELECT theme_data FROM user_themes WHERE user_id = ?', userId);
 
     if (rows.length === 0) {
-      return Response.json({ theme: null });
+      return Response.json({ theme: null, themes: [], activeId: null });
     }
 
     try {
+      const parsed = JSON.parse(rows[0].theme_data);
+      const normalized = normalizeUserThemePayload(parsed);
+      if (!normalized) {
+        return Response.json({ theme: null, themes: [], activeId: null });
+      }
+      const activeTheme =
+        normalized.themes.find((t) => t.id === normalized.activeId) ?? normalized.themes[0] ?? null;
       return Response.json({
-        // 行形状由上方 SELECT('theme_data') 定义，非法 JSON 由 catch 兜底为 null
-        theme: JSON.parse(rows[0].theme_data),
+        theme: activeTheme ? activeTheme.data : null,
+        themes: normalized.themes,
+        activeId: normalized.activeId,
       });
     } catch {
-      return Response.json({ theme: null });
+      return Response.json({ theme: null, themes: [], activeId: null });
     }
   }
 
@@ -1366,6 +1686,46 @@ export class UserDBDO {
       theme_data
     );
 
+    return Response.json({ success: true });
+  }
+
+  /**
+   * 删除用户云端自定义主题。
+   * 支持传 themeId 删除单个主题；缺省时清空整槽。
+   * 幂等：无行时同样返回成功，DELETE 语义不区分是否存在。
+   */
+  private handleDeleteTheme(userId: number, themeId?: string | null): Response {
+    if (themeId) {
+      const rows = this.query<ThemeRow>('SELECT theme_data FROM user_themes WHERE user_id = ?', userId);
+      if (rows.length > 0) {
+        try {
+          const parsed = JSON.parse(rows[0].theme_data);
+          const normalized = normalizeUserThemePayload(parsed);
+          if (normalized) {
+            const remaining = normalized.themes.filter((t) => t.id !== themeId);
+            if (remaining.length === 0) {
+              this.db.exec('DELETE FROM user_themes WHERE user_id = ?', userId);
+              return Response.json({ success: true });
+            }
+            const activeId =
+              normalized.activeId === themeId
+                ? (remaining.length > 0 ? remaining[0].id : null)
+                : normalized.activeId;
+            const updatedPayload = { themes: remaining, activeId };
+            this.db.exec(
+              `UPDATE user_themes SET theme_data = ?, updated_at = datetime('now') WHERE user_id = ?`,
+              JSON.stringify(updatedPayload),
+              userId
+            );
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return Response.json({ success: true });
+    }
+
+    this.db.exec('DELETE FROM user_themes WHERE user_id = ?', userId);
     return Response.json({ success: true });
   }
 
@@ -1423,6 +1783,8 @@ export class UserDBDO {
     const outermost = chain[0];
     const locationHint = outermost.region || outermost.inferred_hint || undefined;
 
+    this.db.exec('UPDATE servers SET last_connected_at = ? WHERE id = ?', Date.now(), serverId);
+
     const userRows = this.db
       .exec('SELECT github_id FROM users WHERE id = ?', body.user_id)
       .toArray();
@@ -1444,6 +1806,14 @@ export class UserDBDO {
       knownHostIdentity: node.identity,
     }));
     const targetNode = resolved[resolved.length - 1];
+    const isTunnel = target.transport_type === 'cf_tunnel';
+    let cfAccessClientSecret: string | undefined;
+    if (isTunnel && target.cf_access_client_secret) {
+      cfAccessClientSecret = await this.decryptCredential(
+        target.cf_access_client_secret,
+        body.user_id
+      );
+    }
     const config: SSHConnectionConfig = {
       host: target.host,
       port: target.port,
@@ -1459,6 +1829,10 @@ export class UserDBDO {
       os: target.os,
       locationHint,
       jumpHosts,
+      transportType: isTunnel ? 'cf_tunnel' : 'direct',
+      cfTunnelHost: isTunnel ? (target.cf_tunnel_host || target.host) : undefined,
+      cfAccessClientId: isTunnel ? (target.cf_access_client_id || undefined) : undefined,
+      cfAccessClientSecret: isTunnel ? cfAccessClientSecret : undefined,
     };
 
     // 防止 token 数量无限增长
@@ -1787,11 +2161,20 @@ export class UserDBDO {
       return Response.json({ error: 'Missing user_id, base_url or model' }, { status: 400 });
     }
 
-    // Check if an existing configuration exists with a valid API key
-    const existing = this.db
-      .exec('SELECT api_key_enc FROM ai_configs WHERE user_id = ?', body.user_id)
-      .toArray();
-    const hasExistingKey = existing.length > 0 && !!(existing[0] as any).api_key_enc;
+    try {
+      body.base_url = normalizeAIBaseUrl(body.base_url);
+    } catch {
+      return Response.json({ error: 'Invalid Responses API address', code: 'responses_address' }, { status: 400 });
+    }
+    const existing = this.query<{ base_url: string; api_key_enc: string }>(
+      'SELECT base_url, api_key_enc FROM ai_configs WHERE user_id = ?', body.user_id
+    );
+    const hasExistingKey = existing.length > 0 && !!existing[0].api_key_enc;
+    if (!body.api_key && hasExistingKey) {
+      let sameAddress = false;
+      try { sameAddress = normalizeAIBaseUrl(existing[0].base_url) === body.base_url; } catch { /* Legacy addresses need explicit reconfiguration. */ }
+      if (!sameAddress) return Response.json({ error: 'API address changed; provide a new key', code: 'responses_key_required' }, { status: 400 });
+    }
 
     if (!body.api_key && !hasExistingKey) {
       return Response.json({ error: '首次配置必须填写 API Key' }, { status: 400 });
@@ -1862,374 +2245,4 @@ export class UserDBDO {
     });
   }
 
-  // ==================== 服务器统一记忆 (Work Logs & Knowledge) ====================
-
-  private handleGetServerMemory(serverId: number, userId: number): Response {
-    const existing = this.query<UserIdRow>('SELECT user_id FROM servers WHERE id = ?', serverId);
-    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if (existing[0].user_id !== userId) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    const workLogs = this.query<WorkLogRow>(
-      `SELECT id, user_id, server_id, title, summary, created_at, updated_at
-       FROM server_work_logs
-       WHERE server_id = ? AND user_id = ?
-       ORDER BY updated_at DESC
-       LIMIT ?`,
-      serverId,
-      userId,
-      MAX_SERVER_WORK_LOGS
-    );
-
-    const knowledge = this.query<KnowledgeRow>(
-      `SELECT id, user_id, server_id, category, key, value, created_at, updated_at
-       FROM server_knowledge
-       WHERE server_id = ? AND user_id = ?
-       ORDER BY updated_at DESC
-       LIMIT ?`,
-      serverId,
-      userId,
-      MAX_SERVER_KNOWLEDGE
-    );
-
-    const payload: UnifiedServerMemory = { workLogs, knowledge };
-    return Response.json(payload);
-  }
-
-  private async handleSaveWorkLog(serverId: number, request: Request): Promise<Response> {
-    const body = await request.json<{
-      user_id: number;
-      title?: unknown;
-      summary?: unknown;
-    }>();
-
-    if (!body.user_id) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-
-    const existing = this.query<UserIdRow>('SELECT user_id FROM servers WHERE id = ?', serverId);
-    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if (existing[0].user_id !== body.user_id) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    const normalized = normalizeWorkLogInput({
-      title: body.title,
-      summary: body.summary,
-    });
-
-    if (!normalized.ok) {
-      return Response.json({ error: normalized.error }, { status: 400 });
-    }
-
-    const { title, summary } = normalized.value;
-    const now = Date.now();
-
-    this.db.exec(
-      `INSERT INTO server_work_logs (user_id, server_id, title, summary, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      body.user_id,
-      serverId,
-      title,
-      summary,
-      now,
-      now
-    );
-
-    // 保持最多 MAX_SERVER_WORK_LOGS 条记录
-    this.db.exec(
-      `DELETE FROM server_work_logs
-       WHERE server_id = ? AND user_id = ? AND id NOT IN (
-         SELECT id FROM server_work_logs
-         WHERE server_id = ? AND user_id = ?
-         ORDER BY updated_at DESC LIMIT ?
-       )`,
-      serverId,
-      body.user_id,
-      serverId,
-      body.user_id,
-      MAX_SERVER_WORK_LOGS
-    );
-
-    const saved = this.query<WorkLogRow>(
-      `SELECT id, user_id, server_id, title, summary, created_at, updated_at
-       FROM server_work_logs
-       WHERE server_id = ? AND user_id = ?
-       ORDER BY updated_at DESC LIMIT 1`,
-      serverId,
-      body.user_id
-    );
-
-    return Response.json(saved[0] ?? { success: true }, { status: 201 });
-  }
-
-  private handleDeleteWorkLog(serverId: number, logId: number, userId: number): Response {
-    const existing = this.query<UserIdRow>(
-      'SELECT user_id FROM server_work_logs WHERE id = ? AND server_id = ?',
-      logId,
-      serverId
-    );
-    if (existing.length === 0) return Response.json({ error: 'Work log not found' }, { status: 404 });
-    if (existing[0].user_id !== userId) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    this.db.exec(
-      'DELETE FROM server_work_logs WHERE id = ? AND server_id = ? AND user_id = ?',
-      logId,
-      serverId,
-      userId
-    );
-    return Response.json({ success: true });
-  }
-
-  private async handleSaveKnowledge(serverId: number, request: Request): Promise<Response> {
-    const body = await request.json<{
-      user_id: number;
-      category?: unknown;
-      key?: unknown;
-      value?: unknown;
-    }>();
-
-    if (!body.user_id) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-
-    const existing = this.query<UserIdRow>('SELECT user_id FROM servers WHERE id = ?', serverId);
-    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if (existing[0].user_id !== body.user_id) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    const normalized = normalizeKnowledgeInput({
-      category: body.category,
-      key: body.key,
-      value: body.value,
-    });
-
-    if (!normalized.ok) {
-      return Response.json({ error: normalized.error }, { status: 400 });
-    }
-
-    const { category, key, value } = normalized.value;
-    const now = Date.now();
-
-    this.db.exec(
-      `INSERT INTO server_knowledge (user_id, server_id, category, key, value, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id, server_id, key) DO UPDATE SET
-         category = excluded.category,
-         value = excluded.value,
-         updated_at = excluded.updated_at`,
-      body.user_id,
-      serverId,
-      category,
-      key,
-      value,
-      now,
-      now
-    );
-
-    // 保持最多 MAX_SERVER_KNOWLEDGE 条记录
-    this.db.exec(
-      `DELETE FROM server_knowledge
-       WHERE server_id = ? AND user_id = ? AND id NOT IN (
-         SELECT id FROM server_knowledge
-         WHERE server_id = ? AND user_id = ?
-         ORDER BY updated_at DESC LIMIT ?
-       )`,
-      serverId,
-      body.user_id,
-      serverId,
-      body.user_id,
-      MAX_SERVER_KNOWLEDGE
-    );
-
-    const saved = this.query<KnowledgeRow>(
-      `SELECT id, user_id, server_id, category, key, value, created_at, updated_at
-       FROM server_knowledge
-       WHERE server_id = ? AND user_id = ? AND key = ?`,
-      serverId,
-      body.user_id,
-      key
-    );
-
-    return Response.json(saved[0] ?? { success: true }, { status: 201 });
-  }
-
-  private handleDeleteKnowledge(serverId: number, kId: number, userId: number): Response {
-    const existing = this.query<UserIdRow>(
-      'SELECT user_id FROM server_knowledge WHERE id = ? AND server_id = ?',
-      kId,
-      serverId
-    );
-    if (existing.length === 0) return Response.json({ error: 'Knowledge item not found' }, { status: 404 });
-    if (existing[0].user_id !== userId) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    this.db.exec(
-      'DELETE FROM server_knowledge WHERE id = ? AND server_id = ? AND user_id = ?',
-      kId,
-      serverId,
-      userId
-    );
-    return Response.json({ success: true });
-  }
-
-  private async handleBatchDeleteKnowledge(serverId: number, request: Request): Promise<Response> {
-    const body = await request.json<{ user_id?: number; ids?: unknown }>();
-    if (!body.user_id) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-
-    const norm = normalizeBatchDeleteKnowledgeInput(body);
-    if (!norm.ok) {
-      return Response.json({ error: norm.error }, { status: 400 });
-    }
-
-    const existing = this.query<UserIdRow>('SELECT user_id FROM servers WHERE id = ?', serverId);
-    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if (existing[0].user_id !== body.user_id) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    const { ids } = norm.value;
-    for (const id of ids) {
-      this.db.exec(
-        'DELETE FROM server_knowledge WHERE id = ? AND server_id = ? AND user_id = ?',
-        id,
-        serverId,
-        body.user_id
-      );
-    }
-
-    return Response.json({ success: true, count: ids.length });
-  }
-
-  private async handleBatchSaveMemory(serverId: number, request: Request): Promise<Response> {
-    const body = await request.json<{
-      user_id: number;
-      workLog?: { mode?: unknown; title?: unknown; summary?: unknown };
-      workLogs?: Array<{ mode?: unknown; title?: unknown; summary?: unknown }>;
-      knowledge?: Array<{ action?: unknown; category?: unknown; key?: unknown; value?: unknown }>;
-    }>();
-
-    if (!body.user_id) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-
-    const existing = this.query<UserIdRow>('SELECT user_id FROM servers WHERE id = ?', serverId);
-    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if (existing[0].user_id !== body.user_id) return Response.json({ error: 'Forbidden' }, { status: 403 });
-
-    const now = Date.now();
-
-    // 1. 保存工作日志（支持单个对象或数组）
-    const rawLogs = Array.isArray(body.workLogs)
-      ? body.workLogs
-      : body.workLog
-        ? [body.workLog]
-        : [];
-
-    if (rawLogs.length > 0) {
-      for (const log of rawLogs) {
-        const norm = normalizeWorkLogInput(
-          { mode: log.mode, title: log.title, summary: log.summary },
-          { truncate: true }
-        );
-        if (!norm.ok) continue;
-
-        if (norm.value.mode === 'update_latest') {
-          const latestRows = this.db
-            .exec(
-              `SELECT id FROM server_work_logs
-               WHERE server_id = ? AND user_id = ?
-               ORDER BY updated_at DESC LIMIT 1`,
-              serverId,
-              body.user_id
-            )
-            .toArray();
-
-          if (latestRows.length > 0) {
-            this.db.exec(
-              `UPDATE server_work_logs
-               SET title = ?, summary = ?, updated_at = ?
-               WHERE id = ?`,
-              norm.value.title,
-              norm.value.summary,
-              now,
-              latestRows[0].id
-            );
-            continue;
-          }
-        }
-
-        this.db.exec(
-          `INSERT INTO server_work_logs (user_id, server_id, title, summary, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          body.user_id,
-          serverId,
-          norm.value.title,
-          norm.value.summary,
-          now,
-          now
-        );
-      }
-
-      this.db.exec(
-        `DELETE FROM server_work_logs
-         WHERE server_id = ? AND user_id = ? AND id NOT IN (
-           SELECT id FROM server_work_logs
-           WHERE server_id = ? AND user_id = ?
-           ORDER BY updated_at DESC LIMIT ?
-         )`,
-        serverId,
-        body.user_id,
-        serverId,
-        body.user_id,
-        MAX_SERVER_WORK_LOGS
-      );
-    }
-
-    // 2. 保存上下文知识或凭据
-    if (Array.isArray(body.knowledge)) {
-      for (const k of body.knowledge) {
-        const norm = normalizeKnowledgeInput(
-          {
-            action: k.action,
-            category: k.category,
-            key: k.key,
-            value: k.value,
-          },
-          { truncate: true }
-        );
-        if (!norm.ok) continue;
-
-        if (norm.value.action === 'delete') {
-          this.db.exec(
-            `DELETE FROM server_knowledge
-             WHERE user_id = ? AND server_id = ? AND key = ?`,
-            body.user_id,
-            serverId,
-            norm.value.key
-          );
-          continue;
-        }
-
-        this.db.exec(
-          `INSERT INTO server_knowledge (user_id, server_id, category, key, value, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(user_id, server_id, key) DO UPDATE SET
-             category = excluded.category,
-             value = excluded.value,
-             updated_at = excluded.updated_at`,
-          body.user_id,
-          serverId,
-          norm.value.category,
-          norm.value.key,
-          norm.value.value,
-          now,
-          now
-        );
-      }
-
-      this.db.exec(
-        `DELETE FROM server_knowledge
-         WHERE server_id = ? AND user_id = ? AND id NOT IN (
-           SELECT id FROM server_knowledge
-           WHERE server_id = ? AND user_id = ?
-           ORDER BY updated_at DESC LIMIT ?
-         )`,
-        serverId,
-        body.user_id,
-        serverId,
-        body.user_id,
-        MAX_SERVER_KNOWLEDGE
-      );
-    }
-
-    return Response.json({ success: true });
-  }
 }

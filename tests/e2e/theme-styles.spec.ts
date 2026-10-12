@@ -51,18 +51,6 @@ test('内置主题切换 UI 风格但保持服务器列表结构稳定', async (
   await expect(card).toHaveCount(1);
   await expect(grid).toHaveClass(/grid-cols-1/);
 
-  await selector.selectOption('apple');
-  await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'soft');
-  await expect(page.locator('html')).toHaveAttribute('data-component-card', 'elevated');
-  await expect(card).toHaveCSS('border-radius', '15px');
-  await expect(terminalSelector).toHaveValue('apple');
-
-  await selector.selectOption('gruvbox');
-  await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'dense');
-  await expect(page.locator('html')).toHaveAttribute('data-ui-density', 'compact');
-  await expect(card).toHaveCSS('border-radius', '9px');
-  await expect(card).toHaveCSS('box-shadow', 'none');
-
   await selector.selectOption('cyberpunk');
   await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'cyberpunk');
   await expect(card).toHaveCSS('border-radius', '0px');
@@ -78,20 +66,15 @@ test('内置主题切换 UI 风格但保持服务器列表结构稳定', async (
     'rgb(74, 246, 38)'
   );
 
-  // V3：CRT 与 Glass 内置主题携带背景/效果/模糊配置
-  await selector.selectOption('crt');
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'crt');
-  await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'cyberpunk');
-  await expect(page.locator('html')).toHaveAttribute('data-fx-scanline', 'on');
-  await expect(page.locator('html')).toHaveAttribute('data-fx-glow', 'on');
-  await expect(terminalSelector).toHaveValue('crt');
-
-  await selector.selectOption('glass');
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'glass');
+  // V3：Liquid Glass 内置主题携带背景/效果/模糊与 liquid 风格专属配置
+  await selector.selectOption('liquid-glass');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'liquid-glass');
+  await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'liquid');
   await expect(page.locator('html')).toHaveAttribute('data-ui-blur', 'strong');
   await expect(page.locator('html')).toHaveAttribute('data-bg-animation', 'drift');
   await expect(page.locator('html')).toHaveAttribute('data-fx-glow', 'on');
   await expect(card).toHaveCSS('border-radius', '21px');
+  await expect(terminalSelector).toHaveValue('liquid-glass');
   expect(
     await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundImage)
   ).toContain('radial-gradient');
@@ -158,9 +141,21 @@ test('终端四周留白按形状收窄并为圆角保留安全间距', async ({
   await expect(terminalMain).toHaveCSS('padding', '7px');
   await expect(terminalWrapper).toHaveCSS('border-radius', '9px');
 
-  await selector.selectOption('apple');
+  await selector.selectOption('liquid-glass');
   await expect(terminalMain).toHaveCSS('padding', '10px');
-  await expect(terminalWrapper).toHaveCSS('border-radius', '15px');
+  await expect(terminalWrapper).toHaveCSS('border-radius', '21px');
+
+  // 打开命令片段抽屉，验证搜索框在 Liquid Glass 下无嵌套边框且搜索图标置顶可见
+  await page.locator('#snippet-toggle-btn').click();
+  const snippetPanel = page.locator('#snippet-panel');
+  await expect(snippetPanel).toBeVisible();
+  const searchInput = page.locator('#snippet-search-input');
+  await expect(searchInput).toBeVisible();
+  await expect(searchInput).toHaveClass(/terminal-input/);
+  await expect(searchInput).toHaveCSS('min-height', '34px');
+  const searchIcon = snippetPanel.locator('span.material-symbols-outlined:has-text("search")');
+  await expect(searchIcon).toBeVisible();
+  await expect(searchIcon).toHaveClass(/z-10/);
 });
 
 test('应用导入 Theme V2 JSON 后覆盖本地主题并同步账号', async ({ page }) => {
@@ -302,9 +297,9 @@ test('AI 模型选择下拉面板在浅色与暗色内置主题下无缝自适�
 
   const userThemeSelector = page.locator('#user-theme-selector');
 
-  // 1. 测试浅色主题 Apple
-  await userThemeSelector.selectOption('apple');
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'apple');
+  // 1. 测试浅色主题 Liquid Glass
+  await userThemeSelector.selectOption('liquid-glass');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'liquid-glass');
 
   await page.locator('#ai-config-btn').click();
   const modal = page.locator('#ai-config-modal');
@@ -323,12 +318,12 @@ test('AI 模型选择下拉面板在浅色与暗色内置主题下无缝自适�
   await expect(unselectedOption).toBeVisible();
   await expect(unselectedOption).toHaveClass(/text-on-surface/);
 
-  // 2. 切换暗色主题 CRT
+  // 2. 切换暗色主题 Cyberpunk
   await page.locator('#ai-modal-close-btn').click();
   await expect(modal).toBeHidden();
 
-  await userThemeSelector.selectOption('crt');
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'crt');
+  await userThemeSelector.selectOption('cyberpunk');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'cyberpunk');
 
   await page.locator('#ai-config-btn').click();
   await expect(modal).toBeVisible();
@@ -336,4 +331,70 @@ test('AI 模型选择下拉面板在浅色与暗色内置主题下无缝自适�
   await expect(menu).toBeVisible();
   await expect(selectedOption).toBeVisible();
   await expect(unselectedOption).toBeVisible();
+});
+
+test('自定义主题分段控制器交互与管理弹窗上传/多套管理/删除回退', async ({ page }) => {
+  await page.goto('/');
+
+  // 1. 验证独立上传按钮已被移除
+  await expect(page.locator('[data-theme-import]')).toHaveCount(0);
+
+  // 2. 验证分段控制器默认展示 5 个主题按钮
+  const customSegmentBtn = page.locator('#user-theme-segmented-container button[data-theme-id="__custom__"]');
+  await expect(customSegmentBtn).toBeVisible();
+  await expect(page.locator('#user-theme-segmented-container button[data-theme-id]')).toHaveCount(5);
+
+  // 3. 点击自定义主题按钮，未上传过时唤起管理弹窗
+  await customSegmentBtn.click();
+  const themeModal = page.locator('#custom-theme-modal');
+  await expect(themeModal).toBeVisible();
+  await expect(themeModal.locator('#custom-theme-dropzone')).toBeVisible();
+
+  // 4. 上传自定义主题
+  const customTheme1 = {
+    schemaVersion: 4,
+    name: 'Neon Horizon',
+    baseTheme: 'cyberpunk',
+    colorScheme: 'dark',
+    ui: {
+      '--accent': '#00ffaa',
+      '--bg': '#0a0a12',
+    },
+    appearance: {
+      style: 'cyberpunk',
+    },
+  };
+
+  await themeModal.locator('#custom-theme-file-input').setInputFiles({
+    name: 'neon-horizon.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(customTheme1)),
+  });
+
+  // 验证列表出现新主题卡片，并且处于激活状态
+  await expect(themeModal.locator('#custom-theme-items-container')).toContainText('Neon Horizon');
+  await expect(themeModal.locator('#custom-theme-items-container')).toContainText('Active');
+
+  // 关闭弹窗并验证分段控制器选中 Custom
+  await themeModal.locator('#custom-theme-modal-close-btn').click();
+  await expect(themeModal).toBeHidden();
+  await expect(customSegmentBtn).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'custom');
+
+  // 5. 已经处于 Custom 主题时，再次点击 Custom 按钮打开管理弹窗
+  await customSegmentBtn.click();
+  await expect(themeModal).toBeVisible();
+
+  // 6. 删除该主题并确认，验证自动回退到内置主题
+  await themeModal.locator('#custom-theme-items-container button[title="Delete"]').click();
+  await page.locator('.app-dialog__button--confirm').click();
+
+  // 验证弹窗内无主题提示并关闭弹窗
+  await expect(themeModal.locator('#custom-theme-items-container')).toContainText('No custom themes yet');
+  await themeModal.locator('#custom-theme-modal-close-btn').click();
+  await expect(themeModal).toBeHidden();
+
+  // 验证主题回退到内置主题（cyberpunk），Custom 不再处于选中状态
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'cyberpunk');
+  await expect(customSegmentBtn).toHaveAttribute('aria-selected', 'false');
 });
