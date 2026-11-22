@@ -1,8 +1,14 @@
+import { readApiJson } from './api-errors';
+import { notifyServerRemoved, serverOwnerKey } from './server-removal';
+import { agentSessionDraftKey } from './agent/session-draft';
+import type { AppConfig } from './app-bootstrap';
 import { copyTextToClipboard } from './clipboard';
 import { isValidTunnelHostname, maskIPAddress } from './host-display';
 import { getLocale, onLocaleChange, t } from './i18n';
 import { osDisplayName, osIconSvg } from './os-icons';
 import { parsePort } from './port';
+import { preparePrivateKey } from './private-key-import';
+import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import { populateRegionSelect, regionLabel } from './regions';
 import { ShareManager } from './share-manager';
 import type { SSHHostInfo } from './terminal';
@@ -23,7 +29,7 @@ export interface ServerConfig {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   region?: string | null;
   inferred_hint?: string | null;
   tags: string[];
@@ -34,6 +40,8 @@ export interface ServerConfig {
   cf_tunnel_host?: string | null;
   cf_access_client_id?: string | null;
   has_cf_access_client_secret?: boolean;
+  /** Cloudflare Zero Trust SSH CA 团队标识（非空表示使用原生 SSH CA 短期证书认证） */
+  cf_ssh_ca_team?: string | null;
   /** 最近连接成功的 Unix 毫秒时间戳 */
   last_connected_at?: number | null;
   created_at: string;
@@ -45,7 +53,7 @@ interface ServerSavePayload {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   tags: string[];
   credential?: string;
   region?: string;
@@ -54,6 +62,7 @@ interface ServerSavePayload {
   cf_tunnel_host?: string;
   cf_access_client_id?: string;
   cf_access_client_secret?: string;
+  cf_ssh_ca_team?: string | null;
 }
 
 interface ServerSaveResponse {
@@ -184,8 +193,11 @@ export class ServerList {
   private onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void;
   private editingServerId: number | null = null;
   private editingOriginalAuthMethod: ServerConfig['auth_method'] | null = null;
-  private modalAuthMode: 'password' | 'key' = 'password';
+  /** 入口隐藏时保留已存团队标识，避免普通编辑把 cf_ssh_ca_team 清成 null。 */
+  private editingOriginalCfTeam: string | null = null;
+  private modalAuthMode: 'password' | 'key' | 'none' | 'cf_ca' = 'password';
   private modalTransportMode: 'direct' | 'cf_tunnel' = 'direct';
+  private modalGeneration = 0;
   private clearCfAccessClientSecret = false;
   private searchQuery = '';
   private selectedTag = '';
@@ -193,16 +205,21 @@ export class ServerList {
   private currentPage = 1;
   private pageSize = currentServerPageSize();
   private sharingEnabled = false;
+  /** 与连接表单一致：只有 Cloudflare Access 登录才显示 SSH CA 入口。 */
+  private cfSshCaEnabled = false;
   private readonly shareManager = new ShareManager();
 
   constructor(
     user: UserInfo,
     onLogout: () => void,
-    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void
+    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void,
+    config: AppConfig
   ) {
     this.user = user;
     this.onLogout = onLogout;
     this.onConnect = onConnect;
+    this.sharingEnabled = config.sshSharingEnabled === true;
+    this.cfSshCaEnabled = config.authMode === 'cf_access';
     try {
       const savedSort = localStorage.getItem(SERVER_SORT_STORAGE_KEY) as ServerSortMode | null;
       if (savedSort && ['recent', 'updated', 'created', 'name'].includes(savedSort)) {
@@ -218,7 +235,9 @@ export class ServerList {
   private async init(): Promise<void> {
     this.renderUserInfo();
     this.bindEvents();
-    await Promise.all([this.fetchSharingConfig(), this.fetchServers()]);
+    this.applyCfSshCaAvailability();
+    this.renderSkeletonGrid();
+    await this.fetchServers();
     this.renderServerGrid();
 
     // 设置用户空间的版权年份
@@ -362,6 +381,10 @@ export class ServerList {
       void this.handleSubmit();
     });
 
+    document.getElementById('server-empty-password')?.addEventListener('change', () => {
+      this.setModalAuthMode(this.modalAuthMode);
+    });
+
     // Modal 认证方式切换
     document
       .getElementById('modal-auth-tab-password')
@@ -369,6 +392,12 @@ export class ServerList {
     document
       .getElementById('modal-auth-tab-key')
       ?.addEventListener('click', () => this.setModalAuthMode('key'));
+    document
+      .getElementById('modal-auth-tab-cf-ca')
+      ?.addEventListener('click', () => this.setModalAuthMode('cf_ca'));
+    document
+      .getElementById('modal-auth-tab-none')
+      ?.addEventListener('click', () => this.setModalAuthMode('none'));
     document
       .getElementById('modal-transport-tab-direct')
       ?.addEventListener('click', () => this.setModalTransportMode('direct'));
@@ -378,6 +407,10 @@ export class ServerList {
     document
       .getElementById('server-jump-host')
       ?.addEventListener('change', () => this.updateRegionControls());
+    document.getElementById('server-cf-access-toggle')?.addEventListener('click', () => {
+      const fields = document.getElementById('server-cf-access-fields');
+      this.setCfAccessFieldsOpen(fields?.classList.contains('hidden') ?? true);
+    });
     document
       .getElementById('server-cf-clear-secret-btn')
       ?.addEventListener('click', () => this.handleClearCfSecret());
@@ -395,7 +428,7 @@ export class ServerList {
 
   private async fetchServers(): Promise<void> {
     try {
-      const res = await fetch('/api/servers');
+      const res = await fetch('/api/servers', { cache: 'no-store' });
       if (!res.ok) throw new Error('Failed to fetch servers');
       const servers = (await res.json()) as ServerConfig[];
       this.servers = servers.map((server) => ({
@@ -410,15 +443,10 @@ export class ServerList {
     }
   }
 
-  private async fetchSharingConfig(): Promise<void> {
-    try {
-      const response = await fetch('/api/config');
-      if (!response.ok) return;
-      const config = (await response.json()) as { sshSharingEnabled?: boolean };
-      this.sharingEnabled = config.sshSharingEnabled === true;
-    } catch {
-      this.sharingEnabled = false;
-    }
+  private applyCfSshCaAvailability(): void {
+    document
+      .getElementById('modal-auth-tab-cf-ca')
+      ?.classList.toggle('hidden', !this.cfSshCaEnabled);
   }
 
   // ==================== 渲染服务器卡片 ====================
@@ -433,6 +461,7 @@ export class ServerList {
     const tagFilter = document.getElementById('server-tag-filter') as HTMLSelectElement | null;
     const pagination = document.getElementById('server-pagination');
     if (!grid || !emptyState || !searchWrapper || !searchEmptyState) return;
+    grid.removeAttribute('aria-busy');
 
     if (this.servers.length === 0) {
       grid.innerHTML = '';
@@ -457,7 +486,6 @@ export class ServerList {
     tagFilterWrapper?.classList.toggle('hidden', allTags.length === 0);
     if (tagFilter) {
       if (this.selectedTag && !allTags.includes(this.selectedTag)) this.selectedTag = '';
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
       tagFilter.innerHTML = [
         `<option value="">${t('server.allTags')}</option>`,
         ...allTags.map(
@@ -490,8 +518,9 @@ export class ServerList {
     this.currentPage = page.currentPage;
     const visibleServers = page.items;
 
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-    grid.innerHTML = visibleServers.map((server) => this.renderServerCard(server)).join('');
+    grid.innerHTML = visibleServers
+      .map((server, index) => this.renderServerCard(server, index, this.searchQuery === ''))
+      .join('');
 
     // 绑定卡片事件
     for (const server of visibleServers) {
@@ -546,6 +575,21 @@ export class ServerList {
     }
   }
 
+  /** 冷加载骨架屏：按当前分页尺寸渲染占位卡片，fetchServers 完成后由 renderServerGrid 整体替换 */
+  private renderSkeletonGrid(): void {
+    const grid = document.getElementById('server-grid');
+    if (!grid) return;
+    grid.setAttribute('aria-busy', 'true');
+    const skeletonCard = `<div class="skeleton-card" aria-hidden="true">
+      <div class="skeleton-line" style="width: 55%"></div>
+      <div class="skeleton-line" style="width: 80%"></div>
+      <div class="skeleton-line" style="width: 70%"></div>
+      <div class="skeleton-line" style="width: 75%"></div>
+      <div class="skeleton-line" style="width: 100%; height: 28px; margin-top: 8px"></div>
+    </div>`;
+    grid.innerHTML = Array.from({ length: this.pageSize }, () => skeletonCard).join('');
+  }
+
   /** 渲染服务器名称前的图标：已识别操作系统 → 品牌 SVG，否则回退到默认 dns 图标 */
   private renderOSIconMarkup(os: string | null | undefined): string {
     const svg = osIconSvg(os);
@@ -556,9 +600,22 @@ export class ServerList {
     return `<span class="material-symbols-outlined text-primary shrink-0" style="font-size: 20px; font-variation-settings: 'FILL' 0;">dns</span>`;
   }
 
-  private renderServerCard(server: ServerConfig): string {
-    const authIcon = server.auth_method === 'publickey' ? 'vpn_key' : 'password';
-    const authLabel = server.auth_method === 'publickey' ? 'KEY' : 'PWD';
+  private renderServerCard(server: ServerConfig, index = 0, animate = false): string {
+    const isCfCa = this.cfSshCaEnabled && Boolean(server.cf_ssh_ca_team);
+    const authIcon = isCfCa
+      ? 'verified_user'
+      : server.auth_method === 'none'
+        ? 'person'
+        : server.auth_method === 'publickey'
+          ? 'vpn_key'
+          : 'password';
+    const authLabel = isCfCa
+      ? 'CF CA'
+      : server.auth_method === 'none'
+        ? 'NONE'
+        : server.auth_method === 'publickey'
+          ? 'KEY'
+          : 'PWD';
     const isTunnel = server.transport_type === 'cf_tunnel';
     const tunnelBadge = isTunnel
       ? `<span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-[var(--accent-secondary)] border border-[var(--accent-secondary)] px-1.5 py-0.5">${t('server.tunnelBadge')}</span>`
@@ -623,7 +680,7 @@ export class ServerList {
       : '';
 
     return `
-      <div class="server-card p-5 relative group" id="card-${server.id}">
+      <div class="server-card p-5 relative group${animate ? ' server-card--enter' : ''}" id="card-${server.id}"${animate ? ` style="--stagger-index: ${index}"` : ''}>
         <div class="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[var(--border-strong)] to-transparent group-hover:via-[var(--accent)] transition-all duration-300"></div>
 
         <div class="flex items-start justify-between gap-2 mb-3">
@@ -693,7 +750,6 @@ export class ServerList {
 
     const connectBtn = document.getElementById(`connect-${serverId}`);
     if (connectBtn) {
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
       connectBtn.innerHTML = `
         <span class="material-symbols-outlined animate-spin" style="font-size: 14px;">progress_activity</span>
         ${t('server.connecting')}
@@ -702,20 +758,26 @@ export class ServerList {
     }
 
     try {
-      const res = await fetch(`/api/servers/${serverId}/connect`, {
-        method: 'POST',
-      });
-
-      if (!res.ok) {
-        const ct = res.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          const err = (await res.json()) as { error?: string };
-          throw new Error(err.error || 'Connection failed');
+      let ephemeralCredential: string | undefined;
+      if (server.cf_ssh_ca_team) {
+        if (connectBtn) {
+          connectBtn.innerHTML = `
+            <span class="material-symbols-outlined animate-spin" style="font-size: 14px;">progress_activity</span>
+            ${t('auth.cfMinting')}
+          `;
         }
-        throw new Error(`服务器错误 (${res.status})`);
+        const creds = await requestCloudflareSshCertificate(server.cf_ssh_ca_team);
+        ephemeralCredential = `${creds.privateKey}\n${creds.certificate}`;
       }
 
-      const { wsUrl } = (await res.json()) as { wsUrl: string };
+      const res = await fetch(`/api/servers/${serverId}/connect`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: ephemeralCredential ? { 'Content-Type': 'application/json' } : undefined,
+        body: ephemeralCredential ? JSON.stringify({ ephemeralCredential }) : undefined,
+      });
+
+      const { wsUrl } = await readApiJson<{ wsUrl: string }>(res, 'api.requestFailed');
 
       // 连接凭证获取成功：记录最新连接时间并在最近连接排序下就地重置至首屏
       server.last_connected_at = Date.now();
@@ -729,6 +791,7 @@ export class ServerList {
         port: server.port,
         username: server.username,
         serverId: server.id,
+        cfSshCaTeam: server.cf_ssh_ca_team || undefined,
       });
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
@@ -737,7 +800,6 @@ export class ServerList {
       });
     } finally {
       if (connectBtn) {
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
         connectBtn.innerHTML = `
           <span class="material-symbols-outlined" style="font-size: 14px;">power_settings_new</span>
           ${t('common.connect')}
@@ -768,11 +830,14 @@ export class ServerList {
         method: 'DELETE',
       });
 
-      if (!res.ok) {
-        const error = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(error.error || t('server.deleteFailed', { message: res.status }));
+      // A proxy/login HTML page with status 200 isn't a committed deletion.
+      const result = await readApiJson<{ success?: boolean }>(res, 'api.requestFailed');
+      if (result.success !== true) throw new Error(t('api.invalidResponse', { status: res.status }));
+      notifyServerRemoved(serverOwnerKey(this.user), serverId);
+      const draftKey = agentSessionDraftKey(this.user.github_id, serverId);
+      if (draftKey) {
+        try { localStorage.removeItem(draftKey); } catch { /* Storage may be unavailable. */ }
       }
-
       // 等待动画完成后移除
       await new Promise((r) => setTimeout(r, 300));
       this.servers = this.servers.filter((s) => s.id !== serverId);
@@ -789,13 +854,18 @@ export class ServerList {
   // ==================== Modal 操作 ====================
 
   showModal(mode: 'add' | 'edit' | 'clone', server?: ServerConfig): void {
+    this.modalGeneration++;
     this.editingServerId = mode === 'edit' && server ? server.id : null;
     this.editingOriginalAuthMethod = mode === 'edit' && server ? server.auth_method : null;
+    this.editingOriginalCfTeam =
+      mode === 'edit' && server?.cf_ssh_ca_team ? server.cf_ssh_ca_team : null;
 
     const modal = document.getElementById('server-modal');
     const title = document.getElementById('modal-title');
     const submitBtn = document.getElementById('server-submit-btn');
     if (!modal || !title || !submitBtn) return;
+    (submitBtn as HTMLButtonElement).disabled = false;
+    (document.getElementById('server-empty-password') as HTMLInputElement).checked = false;
 
     if (mode === 'add') {
       title.textContent = t('server.add');
@@ -804,7 +874,6 @@ export class ServerList {
     } else {
       title.textContent = t('server.edit');
     }
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     submitBtn.innerHTML = `
       <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
       ${mode === 'edit' ? t('server.update') : t('server.save')}
@@ -820,15 +889,21 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = server.username;
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      const cfCaInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      if (cfCaInput) cfCaInput.value = server.cf_ssh_ca_team || '';
       (document.getElementById('server-tags') as HTMLInputElement).value = (server.tags || []).join(
         ', '
       );
 
-      if (server.auth_method === 'publickey') {
-        this.setModalAuthMode('key');
-      } else {
-        this.setModalAuthMode('password');
-      }
+      this.setModalAuthMode(
+        this.cfSshCaEnabled && server.cf_ssh_ca_team
+          ? 'cf_ca'
+          : server.auth_method === 'publickey'
+            ? 'key'
+            : server.auth_method === 'none'
+              ? 'none'
+              : 'password'
+      );
 
       const transport = server.transport_type === 'cf_tunnel' ? 'cf_tunnel' : 'direct';
       this.setModalTransportMode(transport);
@@ -884,6 +959,8 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = '';
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      const cfCaInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      if (cfCaInput) cfCaInput.value = '';
       (document.getElementById('server-tags') as HTMLInputElement).value = '';
       this.setModalAuthMode('password');
       this.setModalTransportMode('direct');
@@ -917,14 +994,16 @@ export class ServerList {
 
     modal.classList.remove('hidden');
     modal.classList.add('flex');
+    const fields = modal.querySelector<HTMLElement>('.server-modal-fields');
+    if (fields) fields.scrollTop = 0;
 
-    // 聚焦第一个输入框
-    setTimeout(() => {
-      (document.getElementById('server-name') as HTMLInputElement)?.focus();
-    }, 100);
+    // Focus synchronously once visible: a delayed callback can steal focus from a
+    // field the user has already started editing, or from a newer dialog.
+    (document.getElementById('server-name') as HTMLInputElement)?.focus({ preventScroll: true });
   }
 
   hideModal(): void {
+    this.modalGeneration++;
     const modal = document.getElementById('server-modal');
     if (modal) {
       modal.classList.add('hidden');
@@ -955,6 +1034,7 @@ export class ServerList {
       if (jumpSection) jumpSection.style.display = 'none';
       if (regionSection) regionSection.style.display = '';
       if (cfAccessSection) cfAccessSection.classList.remove('hidden');
+      this.setCfAccessFieldsOpen(false);
       if (hostLabel) hostLabel.textContent = t('server.tunnelHost');
       if (hostInput) hostInput.placeholder = t('server.tunnelHostPlaceholder');
     } else {
@@ -969,10 +1049,18 @@ export class ServerList {
     // 隐藏时同步移除 required，避免空值阻断表单校验（保存时端口回落 22，仅作存储记录）
     if (portField) portField.style.display = isTunnel ? 'none' : '';
     if (portInput) portInput.required = !isTunnel;
-    hostField?.classList.toggle('sm:col-span-4', isTunnel);
-    hostField?.classList.toggle('sm:col-span-3', !isTunnel);
+    hostField?.classList.toggle('ssh-host-field-wide', isTunnel);
 
     this.updateRegionControls();
+  }
+
+  private setCfAccessFieldsOpen(open: boolean): void {
+    const fields = document.getElementById('server-cf-access-fields');
+    const toggle = document.getElementById('server-cf-access-toggle');
+    const chevron = document.getElementById('server-cf-access-chevron');
+    fields?.classList.toggle('hidden', !open);
+    toggle?.setAttribute('aria-expanded', String(open));
+    if (chevron) chevron.textContent = open ? 'expand_less' : 'expand_more';
   }
 
   private handleClearCfSecret(): void {
@@ -995,17 +1083,31 @@ export class ServerList {
     }
   }
 
-  private setModalAuthMode(mode: 'password' | 'key'): void {
+  private setModalAuthMode(mode: 'password' | 'key' | 'none' | 'cf_ca'): void {
+    if (mode === 'cf_ca' && !this.cfSshCaEnabled) return;
     this.modalAuthMode = mode;
-    const pwTab = document.getElementById('modal-auth-tab-password')!;
-    const keyTab = document.getElementById('modal-auth-tab-key')!;
-    const pwSection = document.getElementById('modal-password-section')!;
-    const keySection = document.getElementById('modal-key-section')!;
-
-    pwTab.classList.toggle('auth-tab-active', mode === 'password');
-    keyTab.classList.toggle('auth-tab-active', mode === 'key');
-    pwSection.style.display = mode === 'password' ? '' : 'none';
-    keySection.style.display = mode === 'key' ? '' : 'none';
+    for (const value of ['password', 'key', 'none', 'cf_ca'] as const) {
+      const tabId = value === 'cf_ca' ? 'modal-auth-tab-cf-ca' : `modal-auth-tab-${value}`;
+      const sectionId = value === 'cf_ca' ? 'modal-cf-ca-section' : `modal-${value}-section`;
+      const tab = document.getElementById(tabId);
+      const section = document.getElementById(sectionId);
+      tab?.classList.toggle('auth-tab-active', mode === value);
+      tab?.setAttribute('aria-pressed', String(mode === value));
+      if (section) section.style.display = mode === value ? '' : 'none';
+    }
+    const editingPassword =
+      mode === 'password' &&
+      this.editingServerId !== null &&
+      this.editingOriginalAuthMethod === 'password';
+    const emptyPassword = document.getElementById('server-empty-password') as HTMLInputElement;
+    document.getElementById('server-empty-password-option')!
+      .classList.toggle('hidden', !editingPassword);
+    (document.getElementById('server-password') as HTMLInputElement).disabled =
+      editingPassword && emptyPassword.checked;
+    const hint = document.getElementById('server-password-hint')!;
+    const hintKey = editingPassword ? 'server.passwordEditHint' : 'auth.passwordHint';
+    hint.dataset.i18n = hintKey;
+    hint.textContent = t(hintKey);
   }
 
   private getJumpPath(server: ServerConfig): string[] {
@@ -1036,12 +1138,17 @@ export class ServerList {
     for (const candidate of this.servers) {
       if (candidate.id === this.editingServerId) continue;
       if (candidate.transport_type === 'cf_tunnel') continue;
+      if (candidate.cf_ssh_ca_team) continue;
       const seen = new Set<number>();
       let current: ServerConfig | undefined = candidate;
       let depth = 0;
       let invalid = false;
       while (current) {
-        if (seen.has(current.id) || current.id === this.editingServerId) {
+        if (
+          seen.has(current.id) ||
+          current.id === this.editingServerId ||
+          current.cf_ssh_ca_team
+        ) {
           invalid = true;
           break;
         }
@@ -1066,7 +1173,6 @@ export class ServerList {
     const jumpSelect = document.getElementById('server-jump-host') as HTMLSelectElement | null;
     const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
     const inferredInfo = document.getElementById('server-region-inferred');
-    const tunnelHint = document.getElementById('server-region-tunnel-hint');
     if (!jumpSelect || !regionSelect || !inferredInfo) return;
 
     const isTunnel = this.modalTransportMode === 'cf_tunnel';
@@ -1075,11 +1181,9 @@ export class ServerList {
       regionSelect.classList.remove('cursor-not-allowed', 'opacity-60');
       inferredInfo.textContent = '';
       inferredInfo.classList.add('hidden');
-      tunnelHint?.classList.remove('hidden');
       return;
     }
 
-    tunnelHint?.classList.add('hidden');
     inferredInfo.classList.remove('hidden');
 
     const usesJumpHost = jumpSelect.value !== '';
@@ -1100,6 +1204,9 @@ export class ServerList {
   }
 
   private async handleSubmit(): Promise<void> {
+    const generation = this.modalGeneration;
+    const editingServerId = this.editingServerId;
+    if ((document.getElementById('server-submit-btn') as HTMLButtonElement).disabled) return;
     const name = (document.getElementById('server-name') as HTMLInputElement).value.trim();
     const host = (document.getElementById('server-host') as HTMLInputElement).value.trim();
     const portInput = document.getElementById('server-port') as HTMLInputElement;
@@ -1143,26 +1250,54 @@ export class ServerList {
       return;
     }
 
-    const authMethod = this.modalAuthMode === 'key' ? 'publickey' : 'password';
-    const credential = authMethod === 'publickey' ? privateKey : password;
+    const isCfCa = this.modalAuthMode === 'cf_ca';
+    let cfSshCaTeam: string | null = null;
+    if (isCfCa) {
+      const teamInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      cfSshCaTeam = teamInput?.value.trim() || '';
+      if (!cfSshCaTeam) {
+        notify(t('auth.cfTeamRequired'), {
+          title: t('server.detailsTitle'),
+          variant: 'warning',
+        });
+        teamInput?.focus();
+        return;
+      }
+    }
+
+    const authMethod =
+      this.modalAuthMode === 'key' || this.modalAuthMode === 'cf_ca'
+        ? 'publickey'
+        : this.modalAuthMode;
+    const useEmptyPassword =
+      authMethod === 'password' &&
+      (document.getElementById('server-empty-password') as HTMLInputElement).checked;
+    let credential =
+      authMethod === 'none' || useEmptyPassword || isCfCa
+        ? ''
+        : authMethod === 'publickey' ? privateKey : password;
     const authMethodChanged =
       this.editingServerId !== null &&
       this.editingOriginalAuthMethod !== null &&
       authMethod !== this.editingOriginalAuthMethod;
 
-    // 新增或切换认证方式时必须填写与新方式匹配的凭据
-    if ((!this.editingServerId || authMethodChanged) && !credential) {
+    // 只有非 CF CA 的常规私钥模式必须非空；编辑已有密码时留空仍保留原值，除非明确勾选设为空密码。
+    if (
+      authMethod === 'publickey' &&
+      !isCfCa &&
+      (!this.editingServerId || authMethodChanged) &&
+      !credential
+    ) {
       notify(
         authMethodChanged
           ? t('server.credentialRequiredAfterAuthChange')
-          : t(authMethod === 'publickey' ? 'auth.validationPrivateKey' : 'auth.validationPassword'),
+          : t('auth.validationPrivateKey'),
         {
           title: t('auth.incompleteCredentials'),
           variant: 'warning',
         }
       );
-      const credentialId = authMethod === 'publickey' ? 'server-private-key' : 'server-password';
-      (document.getElementById(credentialId) as HTMLInputElement | HTMLTextAreaElement)?.focus();
+      (document.getElementById('server-private-key') as HTMLTextAreaElement)?.focus();
       return;
     }
 
@@ -1184,13 +1319,21 @@ export class ServerList {
 
     const submitBtn = document.getElementById('server-submit-btn') as HTMLButtonElement;
     submitBtn.disabled = true;
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     submitBtn.innerHTML = `
       <span class="material-symbols-outlined animate-spin" style="font-size: 18px;">progress_activity</span>
       ${t('server.saving')}
     `;
 
     try {
+      if (authMethod === 'publickey' && credential) {
+        const prepared = await preparePrivateKey(credential, true);
+        if (!prepared || generation !== this.modalGeneration || this.modalAuthMode !== 'key' ||
+            (document.getElementById('server-host') as HTMLInputElement).value.trim() !== host ||
+            (document.getElementById('server-username') as HTMLInputElement).value.trim() !== username ||
+            (document.getElementById('server-private-key') as HTMLTextAreaElement).value !== privateKey ||
+            (this.modalTransportMode === 'cf_tunnel') !== isTunnel) return;
+        credential = prepared.key;
+      }
       const body: ServerSavePayload = {
         name,
         host,
@@ -1201,7 +1344,20 @@ export class ServerList {
         transport_type: this.modalTransportMode,
         jump_server_id: isTunnel ? null : jumpServerId,
       };
-      if (credential) body.credential = credential;
+      const preserveHiddenCfCa =
+        !this.cfSshCaEnabled &&
+        Boolean(this.editingOriginalCfTeam) &&
+        authMethod === 'publickey' &&
+        !authMethodChanged;
+      if (!preserveHiddenCfCa) {
+        body.cf_ssh_ca_team = isCfCa ? cfSshCaTeam : null;
+      }
+      if (
+        credential ||
+        (authMethod === 'password' && (!this.editingServerId || authMethodChanged || useEmptyPassword))
+      ) {
+        body.credential = credential;
+      }
 
       if (isTunnel && cleanTunnelHost) {
         body.cf_tunnel_host = cleanTunnelHost;
@@ -1227,26 +1383,23 @@ export class ServerList {
 
       // 保存请求（后端在保存时会同步推断 locationHint，故时间可能略长）
       let res: Response;
-      if (this.editingServerId) {
-        res = await fetch(`/api/servers/${this.editingServerId}`, {
+      if (editingServerId) {
+        res = await fetch(`/api/servers/${editingServerId}`, {
           method: 'PUT',
+          redirect: 'manual',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
         res = await fetch('/api/servers', {
           method: 'POST',
+          redirect: 'manual',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       }
 
-      if (!res.ok) {
-        const err = (await res.json()) as { error?: string };
-        throw new Error(err.error || 'Save failed');
-      }
-
-      const responseData = (await res.json()) as ServerSaveResponse;
+      const responseData = await readApiJson<ServerSaveResponse>(res, 'api.requestFailed');
       const debugLines = Array.isArray(responseData._debug)
         ? responseData._debug.filter((line): line is string => typeof line === 'string')
         : null;
@@ -1297,12 +1450,14 @@ export class ServerList {
         variant: 'danger',
       });
     } finally {
-      submitBtn.disabled = false;
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-      submitBtn.innerHTML = `
-        <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
-        ${this.editingServerId ? t('server.update') : t('server.save')}
-      `;
+      // An old unlock/save must never mutate a subsequently opened editor's controls.
+      if (generation === this.modalGeneration) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = `
+          <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
+          ${this.editingServerId ? t('server.update') : t('server.save')}
+        `;
+      }
     }
   }
 
@@ -1329,7 +1484,6 @@ export class ServerList {
     const closeBtn = document.createElement('button');
     closeBtn.className =
       'absolute top-2 right-2 text-muted hover:text-[var(--accent)] cursor-pointer';
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     closeBtn.innerHTML =
       '<span class="material-symbols-outlined" style="font-size: 16px;">close</span>';
     closeBtn.onclick = () => notification.remove();
@@ -1351,7 +1505,12 @@ export class ServerList {
 
   private async logout(): Promise<void> {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      const res = await fetch('/api/auth/logout', { method: 'POST' });
+      const data = (await res.json().catch(() => ({}))) as { logoutUrl?: string };
+      if (data?.logoutUrl === '/cdn-cgi/access/logout') {
+        window.location.href = '/cdn-cgi/access/logout';
+        return;
+      }
     } catch {
       // 即使请求失败也清除本地状态
     }

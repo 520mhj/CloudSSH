@@ -1,6 +1,7 @@
 import { getSFTPUploadPolicy } from '../sftp-upload-policy';
 import type { SSHChannel } from '../ssh/channel';
-import { SFTPClient } from '../ssh/sftp';
+import { estimateSFTPEntryBytes, SFTPClient } from '../ssh/sftp';
+import { SFTPDeleteBudget } from './sftp-delete-budget';
 import {
   formatFileSize,
   formatPermissions,
@@ -220,12 +221,19 @@ export class SFTPHandler {
     this.uploadError = null;
   }
 
-  private sendError(operation: SFTPOperation, message: string, code?: string): void {
-    if (code) {
-      this.sendJSON({ type: 'sftp_error', operation, message, code });
-    } else {
-      this.sendJSON({ type: 'sftp_error', operation, message });
-    }
+  private sendError(
+    operation: SFTPOperation,
+    message: string,
+    code?: string,
+    requestId?: string
+  ): void {
+    this.sendJSON({
+      type: 'sftp_error',
+      operation,
+      message,
+      ...(code ? { code } : {}),
+      ...(requestId ? { requestId } : {}),
+    });
   }
 
   private trackUploadWrite(writePromise: Promise<void>): Promise<void> {
@@ -333,31 +341,24 @@ export class SFTPHandler {
     try {
       if (this.debugEnabled) this.sendDebug(`[SFTP] listDirectory: path="${path}"`);
 
-      // Handle ~ as home directory - use realpath(".") to get current dir
-      let resolvePath = path;
-      if (path === '~' || path === '~/') {
-        resolvePath = '.';
-        if (this.debugEnabled) this.sendDebug(`[SFTP] ~ detected, using "." to get home dir`);
-      }
-
-      // Resolve absolute path first
-      const realPathResp = await this.sftp.realpath(resolvePath);
-      const realPathType = realPathResp[0];
+      // Only resolve home/relative paths. REALPATH would replace an absolute
+      // symlink path with its target and break logical breadcrumbs/back navigation.
       let resolvedPath = path;
-      if (realPathType === SSH_FXP_NAME) {
-        const entries = this.sftp.parseNameResponse(realPathResp);
-        if (this.debugEnabled)
-          this.sendDebug(
-            `[SFTP] realpath entries: ${JSON.stringify(entries.map((e) => e.filename))}`
-          );
-        if (entries.length > 0) {
-          resolvedPath = entries[0].filename;
-          if (this.debugEnabled) this.sendDebug(`[SFTP] resolved path: "${resolvedPath}"`);
+      if (!path.startsWith('/')) {
+        const resolvePath = path === '~' || path === '~/' ? '.' : path;
+        const realPathResp = await this.sftp.realpath(resolvePath);
+        const realPathType = realPathResp[0];
+        if (realPathType === SSH_FXP_NAME) {
+          const entries = this.sftp.parseNameResponse(realPathResp);
+          if (entries.length > 0) {
+            resolvedPath = entries[0].filename;
+            if (this.debugEnabled) this.sendDebug(`[SFTP] resolved path: "${resolvedPath}"`);
+          }
+        } else if (realPathType === SSH_FXP_STATUS) {
+          const status = this.sftp.parseStatusResponse(realPathResp);
+          if (this.debugEnabled)
+            this.sendDebug(`[SFTP] realpath failed: code=${status.code}, msg=${status.message}`);
         }
-      } else if (realPathType === SSH_FXP_STATUS) {
-        const status = this.sftp.parseStatusResponse(realPathResp);
-        if (this.debugEnabled)
-          this.sendDebug(`[SFTP] realpath failed: code=${status.code}, msg=${status.message}`);
       }
 
       // Open directory
@@ -402,10 +403,10 @@ export class SFTPHandler {
     }
   }
 
-  // Stat a file
-  async stat(path: string): Promise<void> {
+  // STAT follows symlinks; optional IDs isolate link opening from editor conflict checks.
+  async stat(path: string, requestId?: string): Promise<void> {
     if (!this.ready) {
-      this.sendError('stat', 'SFTP 未就绪');
+      this.sendError('stat', 'SFTP 未就绪', undefined, requestId);
       return;
     }
 
@@ -415,16 +416,28 @@ export class SFTPHandler {
 
       if (type === SSH_FXP_STATUS) {
         const status = this.sftp.parseStatusResponse(resp);
-        this.sendError('stat', status.message);
+        this.sendError('stat', status.message, undefined, requestId);
         return;
       }
 
       if (type === SSH_FXP_ATTRS) {
         const attrs = this.sftp.parseAttrsResponse(resp);
-        this.sendJSON({ type: 'sftp_stat_result', path, attrs: this.formatAttrs(attrs) });
+        this.sendJSON({
+          type: 'sftp_stat_result',
+          path,
+          attrs: this.formatAttrs(attrs),
+          ...(requestId ? { requestId } : {}),
+        });
+      } else {
+        this.sendError('stat', '获取文件信息失败', undefined, requestId);
       }
     } catch (e) {
-      this.sendError('stat', '获取文件信息失败: ' + (e instanceof Error ? e.message : String(e)));
+      this.sendError(
+        'stat',
+        '获取文件信息失败: ' + (e instanceof Error ? e.message : String(e)),
+        undefined,
+        requestId
+      );
     }
   }
 
@@ -567,9 +580,15 @@ export class SFTPHandler {
     let offset = 0;
     while (true) {
       this.throwIfDownloadCancelled();
-      const chunkData = await this.readBlock(handle, offset, DOWNLOAD_CHUNK_SIZE);
+      // Probe at most one byte beyond the limit, so an exactly-full file may
+      // still finish successfully at EOF without buffering another whole chunk.
+      const length = Math.min(DOWNLOAD_CHUNK_SIZE, MAX_SFTP_FILE_SIZE - offset + 1);
+      const chunkData = await this.readBlock(handle, offset, length);
       this.throwIfDownloadCancelled();
       if (chunkData.length === 0) break;
+      if (chunkData.length > MAX_SFTP_FILE_SIZE - offset) {
+        throw new Error(`文件过大，最大支持 ${formatFileSize(MAX_SFTP_FILE_SIZE)}`);
+      }
 
       this.sendBinary(chunkData);
       offset += chunkData.length;
@@ -1021,10 +1040,15 @@ export class SFTPHandler {
    * 1. 严格跳过 '.' 与 '..'；
    * 2. 遇到符号链接（symlink）直接解除链接（removeFile），不递归深入，防止死循环；
    * 3. 遇到子目录深度优先递归删除；
-   * 4. 清空全部条目后调用 rmdir 删除当前空目录。
+   * 4. 清空全部条目后调用 rmdir 删除当前空目录；
+   * 5. 整棵树共享条目/请求/深度/时间预算；截断时不对该目录执行部分删除。
    */
-  private async rmdirRecursive(dirPath: string): Promise<void> {
-    const openResp = await this.sftp.openDir(dirPath);
+  private async rmdirRecursive(
+    dirPath: string, budget = new SFTPDeleteBudget(), depth = 0
+  ): Promise<void> {
+    budget.checkDepth(depth);
+    budget.takeRequests(2); // Reserve OPENDIR + its mandatory cleanup CLOSE.
+    const openResp = await this.sftp.openDir(dirPath, { deadline: budget.deadline });
     const openType = openResp[0];
     if (openType === SSH_FXP_STATUS) {
       const status = this.sftp.parseStatusResponse(openResp);
@@ -1037,10 +1061,24 @@ export class SFTPHandler {
     const handle = this.sftp.parseHandleResponse(openResp);
     let entries: SFTPFileEntry[] = [];
     try {
-      const result = await this.sftp.listAllEntries(handle);
+      const result = await this.sftp.listAllEntries(handle, budget.policy.maxDirectoryEntries, {
+        deadline: budget.deadline,
+        beforeRequest: () => budget.takeRequests(),
+      });
+      if (result.isTruncated) throw new Error('SFTP recursive delete directory entry limit exceeded');
       entries = result.entries;
+      budget.takeEntries(entries.length, entries.reduce((bytes, entry) =>
+        bytes + estimateSFTPEntryBytes(entry), 0));
+      for (const entry of entries) {
+        if (!entry.filename || /[/\\\\\0]/.test(entry.filename)) {
+          throw new Error('Invalid SFTP directory entry name');
+        }
+      }
     } finally {
-      await this.sftp.closeHandle(handle).catch(() => {});
+      // Even an expired budget must allow one bounded handle cleanup attempt.
+      await this.sftp.closeHandle(handle, {
+        deadline: Math.min(budget.deadline + 5000, Date.now() + 5000),
+      }).catch(() => {});
     }
 
     for (const entry of entries) {
@@ -1051,9 +1089,10 @@ export class SFTPHandler {
       const isDir = getFileTypeFromPermissions(entry.attrs.permissions ?? 0) === 'dir';
 
       if (isDir) {
-        await this.rmdirRecursive(childPath);
+        await this.rmdirRecursive(childPath, budget, depth + 1);
       } else {
-        const rmResp = await this.sftp.removeFile(childPath);
+        budget.takeRequests();
+        const rmResp = await this.sftp.removeFile(childPath, { deadline: budget.deadline });
         if (rmResp[0] === SSH_FXP_STATUS) {
           const status = this.sftp.parseStatusResponse(rmResp);
           if (status.code !== SSH_FX_OK) {
@@ -1063,7 +1102,8 @@ export class SFTPHandler {
       }
     }
 
-    const rmdirResp = await this.sftp.rmdir(dirPath);
+    budget.takeRequests();
+    const rmdirResp = await this.sftp.rmdir(dirPath, { deadline: budget.deadline });
     if (rmdirResp[0] === SSH_FXP_STATUS) {
       const status = this.sftp.parseStatusResponse(rmdirResp);
       if (status.code !== SSH_FX_OK) {
@@ -1080,8 +1120,10 @@ export class SFTPHandler {
     }
 
     try {
+      const budget = new SFTPDeleteBudget();
+      budget.takeRequests();
       // 优先尝试标准 rmdir（若为空目录直接高效删除）
-      const resp = await this.sftp.rmdir(path);
+      const resp = await this.sftp.rmdir(path, { deadline: budget.deadline });
       const type = resp[0];
 
       if (type === SSH_FXP_STATUS) {
@@ -1091,12 +1133,13 @@ export class SFTPHandler {
           return;
         }
 
-        // 若返回 Failure（POSIX rmdir 对非空目录返回 ENOTEMPTY），自动转入深度递归删除！
-        if (status.code === SSH_FX_FAILURE || status.message === 'Failure') {
+        // Generic Failure may mean non-empty, but is not proof of ENOTEMPTY.
+        // Never use message text to turn an explicit permission failure into recursion.
+        if (status.code === SSH_FX_FAILURE) {
           if (this.debugEnabled) {
             this.sendDebug(`[SFTP] rmdir failed with Failure, attempting recursive deletion for: ${path}`);
           }
-          await this.rmdirRecursive(path);
+          await this.rmdirRecursive(path, budget);
           this.sendJSON({ type: 'sftp_rmdir_result', path, success: true });
           return;
         }
